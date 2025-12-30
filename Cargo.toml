@@ -47,3 +47,7 @@ strip = true
 
 [profile.dev]
 opt-level = 1
+
+[[example]]
+name = "click_game"
+path = "examples/click_game.rs"

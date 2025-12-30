@@ -315,10 +315,9 @@ impl eframe::App for LightScanApp {
 
             // Only show scan UI if a process is selected
             if self.scanner.is_some() {
-                ui.horizontal(|ui| {
+                ui.columns(2, |columns| {
                     // Left panel - Scan controls
-                    ui.vertical(|ui| {
-                        ui.set_min_width(250.0);
+                    columns[0].vertical(|ui| {
                         ui.heading("Scan");
 
                         self.scan_view.ui(ui);
@@ -346,10 +345,8 @@ impl eframe::App for LightScanApp {
                         ui.label(format!("Results: {}", self.results_view.result_count()));
                     });
 
-                    ui.separator();
-
                     // Right panel - Results
-                    ui.vertical(|ui| {
+                    columns[1].vertical(|ui| {
                         ui.heading("Results");
                         self.results_view.ui(ui, &self.scanner);
                     });
