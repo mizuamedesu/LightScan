@@ -57,6 +57,13 @@ impl UnrealEngine {
     }
 
     /// すべてのクラスを列挙
+    ///
+    /// UClass の検出ロジック:
+    /// - UClass インスタンス: Class->Class == Class (自己参照)
+    /// - BlueprintGeneratedClass インスタンス: Class->Class == UClass
+    /// - WidgetBlueprintGeneratedClass インスタンス: Class->Class->Class == UClass
+    ///
+    /// つまり、Class ポインタを辿って最終的に自己参照するものが「クラス」
     pub(super) fn enumerate_classes_impl(&self) -> Result<Vec<ClassInfo>> {
         let all_objects = self.get_all_objects_impl()?;
         let handle = unsafe { std::mem::transmute::<usize, WinHandle>(self.process_handle) };
@@ -66,8 +73,8 @@ impl UnrealEngine {
         let mut classes = Vec::new();
         let mut valid_obj_count = 0;
         let mut has_class_count = 0;
-        let mut class_read_ok_count = 0;
         let mut is_class_count = 0;
+        let mut bp_class_count = 0;
 
         // Debug: show first few objects
         for (i, &obj_addr) in all_objects.iter().take(5).enumerate() {
@@ -80,27 +87,61 @@ impl UnrealEngine {
         }
 
         for obj_addr in &all_objects {
-            // UClass かどうかをチェック
             if let Ok(obj) = UObject::read(handle, *obj_addr) {
                 valid_obj_count += 1;
-                if obj.class != 0 {
-                    has_class_count += 1;
-                    if let Ok(class_obj) = UObject::read(handle, obj.class) {
-                        class_read_ok_count += 1;
-                        // Class->Class == Class なら UClass
-                        if class_obj.class == obj.class {
-                            is_class_count += 1;
-                            if let Ok(info) = self.get_class_info_impl(*obj_addr) {
-                                classes.push(info);
-                            }
+                if obj.class == 0 {
+                    continue;
+                }
+                has_class_count += 1;
+
+                // このオブジェクトが「クラス」かどうかを判定
+                // クラスとは: UClass またはその派生 (BlueprintGeneratedClass など) のインスタンス
+                //
+                // 判定方法: Class ポインタを最大 3 回辿って自己参照に到達するか
+                // - UClass: Class->Class == Class (1回で自己参照)
+                // - BlueprintGeneratedClass: Class->Class->Class == Class->Class (2回で自己参照)
+
+                let mut is_class_type = false;
+                let mut current = obj.class;
+                let mut visited = vec![current];
+
+                for _ in 0..3 {
+                    if let Ok(current_obj) = UObject::read(handle, current) {
+                        if current_obj.class == current {
+                            // 自己参照に到達 = これは UClass (またはそのメタクラス)
+                            is_class_type = true;
+                            break;
                         }
+                        if visited.contains(&current_obj.class) {
+                            // ループ検出 - 自己参照ではないが循環
+                            break;
+                        }
+                        visited.push(current_obj.class);
+                        current = current_obj.class;
+                    } else {
+                        break;
+                    }
+                }
+
+                if is_class_type {
+                    is_class_count += 1;
+
+                    // Blueprint クラスかどうかチェック (Class->Class != Class の場合)
+                    if let Ok(class_meta) = UObject::read(handle, obj.class) {
+                        if class_meta.class != obj.class {
+                            bp_class_count += 1;
+                        }
+                    }
+
+                    if let Ok(info) = self.get_class_info_impl(*obj_addr) {
+                        classes.push(info);
                     }
                 }
             }
         }
 
-        tracing::info!("enumerate_classes_impl stats: valid_obj={}, has_class={}, class_read_ok={}, is_class={}, final={}",
-            valid_obj_count, has_class_count, class_read_ok_count, is_class_count, classes.len());
+        tracing::info!("enumerate_classes_impl stats: valid_obj={}, has_class={}, is_class={} (bp={}), final={}",
+            valid_obj_count, has_class_count, is_class_count, bp_class_count, classes.len());
 
         Ok(classes)
     }
