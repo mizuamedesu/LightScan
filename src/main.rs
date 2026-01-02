@@ -7,6 +7,9 @@ fn main() -> eframe::Result<()> {
     // Initialize tracing/logging
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
+        .without_time()
+        .with_target(false)
+        .with_level(false)
         .init();
 
     tracing::info!("Starting LightScan...");
