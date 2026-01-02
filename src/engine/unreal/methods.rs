@@ -562,4 +562,60 @@ impl UnrealEngine {
         tracing::info!("enumerate_fields_impl: found {} properties", fields.len());
         Ok(fields)
     }
+
+    // =========================================================================
+    // インスタンス関連の実装
+    // =========================================================================
+
+    /// 指定されたクラス（またはその派生クラス）のすべてのインスタンスを取得
+    pub(super) fn get_instances_impl(&self, class_addr: usize) -> Result<Vec<InstanceHandle>> {
+        let all_objects = self.get_all_objects_impl()?;
+        let handle = unsafe { std::mem::transmute::<usize, WinHandle>(self.process_handle) };
+
+        let mut instances = Vec::new();
+
+        for obj_addr in &all_objects {
+            if let Ok(obj) = UObject::read(handle, *obj_addr) {
+                // このオブジェクトが指定されたクラスのインスタンスかどうかをチェック
+                // 直接一致、または派生クラスのインスタンスかを確認
+                if self.is_instance_of(handle, obj.class, class_addr) {
+                    instances.push(InstanceHandle(*obj_addr));
+                }
+            }
+        }
+
+        tracing::info!("get_instances_impl: found {} instances of class 0x{:X}", instances.len(), class_addr);
+        Ok(instances)
+    }
+
+    /// obj_class が target_class またはその派生クラスかどうかを判定
+    fn is_instance_of(&self, handle: WinHandle, obj_class: usize, target_class: usize) -> bool {
+        if obj_class == 0 {
+            return false;
+        }
+
+        // 直接一致
+        if obj_class == target_class {
+            return true;
+        }
+
+        // 継承チェーン (SuperStruct) を辿って確認
+        // 最大 20 レベルまで（無限ループ防止）
+        let mut current = obj_class;
+        for _ in 0..20 {
+            if let Ok(ustruct) = UStruct::read(handle, current) {
+                if ustruct.super_struct == 0 {
+                    break;
+                }
+                if ustruct.super_struct == target_class {
+                    return true;
+                }
+                current = ustruct.super_struct;
+            } else {
+                break;
+            }
+        }
+
+        false
+    }
 }

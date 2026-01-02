@@ -280,9 +280,8 @@ impl GameEngine for UnrealEngine {
         self.enumerate_fields_impl(class.0)
     }
 
-    fn get_instances(&self, _class: ClassHandle) -> Result<Vec<InstanceHandle>> {
-        // TODO: GObjects を走査してインスタンスを収集
-        Ok(Vec::new())
+    fn get_instances(&self, class: ClassHandle) -> Result<Vec<InstanceHandle>> {
+        self.get_instances_impl(class.0)
     }
 
     fn get_instance_class(&self, _instance: InstanceHandle) -> Result<ClassHandle> {

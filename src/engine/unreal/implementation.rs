@@ -1021,15 +1021,7 @@ impl UnrealEngine {
 
         tracing::info!("Scanning data sections from 0x{:X} to 0x{:X} (limited range)...", scan_start, scan_end);
 
-        let mut scanned = 0;
-
         for addr in (scan_start..scan_end).step_by(step) {
-            scanned += 1;
-            // 進捗表示
-            if scanned % 100 == 0 {
-                tracing::info!("  Scanned {} pages...", scanned);
-            }
-
             if let Ok(data) = read_process_memory(handle, addr, step) {
                 // 8バイトアラインメントでポインタっぽい値を探す
                 for offset in (0..data.len() - 64).step_by(8) {
