@@ -379,39 +379,46 @@ impl UStruct {
 }
 
 /// FField - UE5 の新しいプロパティ基底クラス (UObject を継承しない)
-/// UE5.5 レイアウト (Field.h より):
-/// - ClassPrivate (8 bytes) - FFieldClass*
-/// - Owner (8 bytes) - FFieldVariant (union of FField* | UObject*, just a pointer)
-/// - Next (8 bytes) - FField*
-/// - NamePrivate (8 bytes) - FName
-/// - FlagsPrivate (4 bytes) - EObjectFlags
+///
+/// UE5.5 実際のメモリレイアウト (実測):
+/// - ClassPrivate (8 bytes) - FFieldClass* - offset 0
+/// - Unknown/Padding (8 bytes) - offset 8 (vtable? または WITH_METADATA のポインタ?)
+/// - Owner (8 bytes) - FFieldVariant - offset 16
+/// - Next (8 bytes) - FField* - offset 24
+/// - NamePrivate (8 bytes) - FName - offset 32
+/// - FlagsPrivate (4 bytes) - EObjectFlags - offset 40
+///
+/// 注: 実際のFFieldは WITH_METADATA が定義されている場合、
+///     TMap<FName, FString>* MetaDataMap がオフセット8にある可能性
 #[repr(C)]
 #[derive(Debug)]
 pub struct FField {
     pub class_private: usize,    // FFieldClass* - offset 0
-    pub owner: usize,            // FFieldVariant (単なるポインタ) - offset 8
-    pub next: usize,             // FField* - 次のプロパティ - offset 16
-    pub name: FName,             // FName - offset 24
-    pub flags: u32,              // EObjectFlags - offset 32
+    pub metadata_or_pad: usize,  // Unknown/MetaDataMap* - offset 8
+    pub owner: usize,            // FFieldVariant - offset 16
+    pub next: usize,             // FField* - 次のプロパティ - offset 24
+    pub name: FName,             // FName - offset 32
+    pub flags: u32,              // EObjectFlags - offset 40
 }
 
 impl FField {
-    /// FField::Next のオフセット
-    pub const NEXT_OFFSET: usize = 16; // ClassPrivate(8) + Owner(8)
+    /// FField::Next のオフセット (新レイアウト)
+    pub const NEXT_OFFSET: usize = 24; // ClassPrivate(8) + Unknown(8) + Owner(8)
     /// FField::Name のオフセット
-    pub const NAME_OFFSET: usize = 24; // + Next(8)
+    pub const NAME_OFFSET: usize = 32; // + Next(8)
 
     pub fn read(handle: HANDLE, address: usize) -> Result<Self, anyhow::Error> {
-        let data = read_process_memory(handle, address, 40)?;
+        let data = read_process_memory(handle, address, 48)?;
         Ok(Self {
             class_private: usize::from_le_bytes(data[0..8].try_into().unwrap()),
-            owner: usize::from_le_bytes(data[8..16].try_into().unwrap()),
-            next: usize::from_le_bytes(data[16..24].try_into().unwrap()),
+            metadata_or_pad: usize::from_le_bytes(data[8..16].try_into().unwrap()),
+            owner: usize::from_le_bytes(data[16..24].try_into().unwrap()),
+            next: usize::from_le_bytes(data[24..32].try_into().unwrap()),
             name: FName {
-                comparison_index: u32::from_le_bytes(data[24..28].try_into().unwrap()),
-                number: u32::from_le_bytes(data[28..32].try_into().unwrap()),
+                comparison_index: u32::from_le_bytes(data[32..36].try_into().unwrap()),
+                number: u32::from_le_bytes(data[36..40].try_into().unwrap()),
             },
-            flags: u32::from_le_bytes(data[32..36].try_into().unwrap()),
+            flags: u32::from_le_bytes(data[40..44].try_into().unwrap()),
         })
     }
 }

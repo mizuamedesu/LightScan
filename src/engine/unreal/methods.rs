@@ -42,7 +42,10 @@ impl UnrealEngine {
         let all_objects = self.get_all_objects_impl()?;
         let handle = unsafe { std::mem::transmute::<usize, WinHandle>(self.process_handle) };
 
+        tracing::info!("enumerate_classes_impl: scanning {} objects", all_objects.len());
+
         let mut classes = Vec::new();
+        let mut class_type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
         for obj_addr in &all_objects {
             if let Ok(obj) = UObject::read(handle, *obj_addr) {
@@ -60,9 +63,11 @@ impl UnrealEngine {
                 let mut is_class_type = false;
                 let mut current = obj.class;
                 let mut visited = vec![current];
+                let mut hops = 0;
 
                 for _ in 0..3 {
                     if let Ok(current_obj) = UObject::read(handle, current) {
+                        hops += 1;
                         if current_obj.class == current {
                             // 自己参照に到達 = これは UClass (またはそのメタクラス)
                             is_class_type = true;
@@ -81,10 +86,23 @@ impl UnrealEngine {
 
                 if is_class_type {
                     if let Ok(info) = self.get_class_info_impl(*obj_addr) {
+                        // クラスタイプ（Class名）を取得して統計
+                        if let Ok(class_type_name) = self.get_object_name_impl(obj.class) {
+                            *class_type_counts.entry(class_type_name).or_insert(0) += 1;
+                        }
                         classes.push(info);
                     }
                 }
             }
+        }
+
+        // クラスタイプの統計をログ
+        let mut sorted_counts: Vec<_> = class_type_counts.into_iter().collect();
+        sorted_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        tracing::info!("enumerate_classes_impl: found {} classes", classes.len());
+        tracing::info!("enumerate_classes_impl: class type breakdown:");
+        for (type_name, count) in sorted_counts.iter().take(10) {
+            tracing::info!("  {}: {} instances", type_name, count);
         }
 
         Ok(classes)
@@ -478,13 +496,32 @@ impl UnrealEngine {
         // デバッグ: FFieldの生データをダンプ
         static FIELD_DEBUG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let debug_count = FIELD_DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if debug_count < 3 && current_field != 0 {
-            if let Ok(raw_data) = read_process_memory(handle, current_field, 64) {
+        if debug_count < 5 && current_field != 0 {
+            if let Ok(raw_data) = read_process_memory(handle, current_field, 80) {
                 tracing::info!("  FField raw data at 0x{:X}:", current_field);
-                for i in 0..8 {
+                for i in 0..10 {
                     let offset = i * 8;
                     let val = usize::from_le_bytes(raw_data[offset..offset+8].try_into().unwrap());
                     tracing::info!("    [+{:2}] 0x{:02X}: 0x{:016X}", offset, offset, val);
+                }
+
+                // FField構造解釈 (UE5.5 新レイアウト: 8バイト追加)
+                let class_private = usize::from_le_bytes(raw_data[0..8].try_into().unwrap());
+                let metadata_or_pad = usize::from_le_bytes(raw_data[8..16].try_into().unwrap());
+                let owner = usize::from_le_bytes(raw_data[16..24].try_into().unwrap());
+                let next = usize::from_le_bytes(raw_data[24..32].try_into().unwrap());
+                let name_index = u32::from_le_bytes(raw_data[32..36].try_into().unwrap());
+                let name_number = u32::from_le_bytes(raw_data[36..40].try_into().unwrap());
+                let flags = u32::from_le_bytes(raw_data[40..44].try_into().unwrap());
+
+                tracing::info!("  FField parsed: ClassPrivate=0x{:X}, MetaOrPad=0x{:X}", class_private, metadata_or_pad);
+                tracing::info!("  FField parsed: Owner=0x{:X}, Next=0x{:X}", owner, next);
+                tracing::info!("  FField parsed: NameIndex=0x{:X}, NameNumber={}, Flags=0x{:X}",
+                    name_index, name_number, flags);
+
+                // 名前を取得してみる
+                if let Ok(name) = self.get_fname_impl(name_index) {
+                    tracing::info!("  FField name: '{}'", name);
                 }
             }
         }
@@ -494,13 +531,31 @@ impl UnrealEngine {
             // 無限ループ防止
             count += 1;
 
-            if let Ok(field) = FField::read(handle, current_field) {
-                if let Ok(info) = self.get_field_info_impl(current_field) {
-                    fields.push(info);
-                }
-                current_field = field.next;
-            } else {
+            // ポインタの妥当性チェック
+            if current_field < 0x10000 || current_field > 0x7FFFFFFFFFFF {
+                tracing::warn!("  Invalid field pointer: 0x{:X}", current_field);
                 break;
+            }
+
+            match FField::read(handle, current_field) {
+                Ok(field) => {
+                    // 名前を取得してデバッグ
+                    if count <= 10 {
+                        if let Ok(name) = self.get_fname_impl(field.name.comparison_index) {
+                            tracing::info!("  Field {}: '{}' at 0x{:X}, next=0x{:X}",
+                                count, name, current_field, field.next);
+                        }
+                    }
+
+                    if let Ok(info) = self.get_field_info_impl(current_field) {
+                        fields.push(info);
+                    }
+                    current_field = field.next;
+                }
+                Err(e) => {
+                    tracing::warn!("  Failed to read FField at 0x{:X}: {}", current_field, e);
+                    break;
+                }
             }
         }
 

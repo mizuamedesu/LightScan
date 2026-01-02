@@ -21,6 +21,9 @@ pub struct EngineView {
     /// 選択されたクラスのメソッド
     methods: Vec<MethodInfo>,
 
+    /// 選択されたクラスのフィールド
+    fields: Vec<FieldInfo>,
+
     /// 選択されたメソッド
     selected_method: Option<MethodHandle>,
 
@@ -42,6 +45,7 @@ pub struct EngineView {
     /// 検索フィルタ
     class_filter: String,
     method_filter: String,
+    field_filter: String,
 }
 
 impl Default for EngineView {
@@ -53,6 +57,7 @@ impl Default for EngineView {
             selected_class_name: String::new(),
             classes: Vec::new(),
             methods: Vec::new(),
+            fields: Vec::new(),
             selected_method: None,
             instances: Vec::new(),
             selected_instance: None,
@@ -61,6 +66,7 @@ impl Default for EngineView {
             error_message: String::new(),
             class_filter: String::new(),
             method_filter: String::new(),
+            field_filter: String::new(),
         }
     }
 }
@@ -71,6 +77,7 @@ impl EngineView {
         self.initialized = false;
         self.classes.clear();
         self.methods.clear();
+        self.fields.clear();
         self.instances.clear();
     }
 
@@ -166,6 +173,7 @@ impl EngineView {
                     self.selected_class = Some(handle);
                     self.selected_class_name = name;
                     self.load_methods();
+                    self.load_fields();
                     self.load_instances();
                 }
             });
@@ -184,6 +192,8 @@ impl EngineView {
                     ui.label("Filter:");
                     ui.text_edit_singleline(&mut self.method_filter);
                 });
+
+                ui.label(format!("Found {} methods", self.methods.len()));
 
                 egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
                     let filtered: Vec<_> = self
@@ -206,6 +216,36 @@ impl EngineView {
                         if ui.selectable_label(selected, &method.name).clicked() {
                             self.selected_method = Some(method.handle);
                         }
+                    }
+                });
+            });
+
+            ui.separator();
+
+            // フィールド（プロパティ）ビューア
+            ui.collapsing("Fields / Properties", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Filter:");
+                    ui.text_edit_singleline(&mut self.field_filter);
+                });
+
+                ui.label(format!("Found {} fields", self.fields.len()));
+
+                egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                    let filtered: Vec<_> = self
+                        .fields
+                        .iter()
+                        .filter(|f| {
+                            self.field_filter.is_empty()
+                                || f.name
+                                    .to_lowercase()
+                                    .contains(&self.field_filter.to_lowercase())
+                        })
+                        .collect();
+
+                    for field in filtered {
+                        let label = format!("{} (offset: 0x{:X})", field.name, field.offset);
+                        ui.label(label);
                     }
                 });
             });
@@ -317,6 +357,26 @@ impl EngineView {
                         }
                         Err(e) => {
                             self.error_message = format!("Failed to load methods: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn load_fields(&mut self) {
+        if let Some(class) = self.selected_class {
+            if let Some(engine) = &self.engine {
+                if let Ok(eng) = engine.lock() {
+                    match eng.enumerate_fields(class) {
+                        Ok(fields) => {
+                            self.fields = fields;
+                            self.status_message =
+                                format!("Loaded {} fields", self.fields.len());
+                            self.error_message.clear();
+                        }
+                        Err(e) => {
+                            self.error_message = format!("Failed to load fields: {}", e);
                         }
                     }
                 }
