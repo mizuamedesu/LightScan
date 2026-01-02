@@ -38,6 +38,18 @@ impl UESignatures {
     /// GObjects UE5パターン
     pub const GOBJECTS_UE5: &'static str = "48 8B 05 ?? ?? ?? ?? 48 63 0C 88";
 
+    /// GObjects UE5.5パターン - FUObjectArray::IndexToObject関連
+    /// mov rax/rcx, [rip+offset] followed by movsxd (sign-extend index)
+    pub const GOBJECTS_UE5_INDEXTO: &'static str = "48 8B 0D ?? ?? ?? ?? 48 63 C2 48 8D";
+
+    /// GObjects UE5.5パターン2 - ObjObjects.Num()
+    /// movsxd rax, dword ptr [rip + offset] - NumElementsを読む
+    pub const GOBJECTS_UE5_NUM: &'static str = "48 63 05 ?? ?? ?? ?? 39";
+
+    /// GObjects UE5.5パターン3 - GetObjectItemArrayUnsafe
+    /// mov rax, qword ptr [rip + offset] followed by specific operations
+    pub const GOBJECTS_UE5_GETARRAY: &'static str = "48 8B 05 ?? ?? ?? ?? 4C 8D ?? 48";
+
     /// ProcessEvent パターン (UE4.20+)
     /// 関数プロローグ: push rbp; push rsi; push rdi; push r12-r15; sub rsp, ???
     pub const PROCESS_EVENT: &'static str =
@@ -76,9 +88,14 @@ impl VersionSignatures {
                 UESignatures::GNAMES_ALT3,
             ],
             gobjects_patterns: vec![
-                UESignatures::GOBJECTS_UE5,  // UE5を先に
-                UESignatures::GOBJECTS,
-                UESignatures::GOBJECTS_ALT
+                // 元のパターン（より特定的）を先に
+                UESignatures::GOBJECTS,       // 48 8B 0D + 48 8D 14 C1
+                UESignatures::GOBJECTS_ALT,   // 48 8B 05 + 48 8B 0C C8 48 8D 04 D1
+                // UE5専用パターン
+                UESignatures::GOBJECTS_UE5,   // 48 8B 05 + 48 63 0C 88
+                UESignatures::GOBJECTS_UE5_INDEXTO,
+                UESignatures::GOBJECTS_UE5_NUM,
+                UESignatures::GOBJECTS_UE5_GETARRAY,
             ],
             process_event_patterns: vec![
                 UESignatures::PROCESS_EVENT,

@@ -13,10 +13,36 @@ use windows::Win32::System::Memory::{VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, 
 impl UnrealEngine {
     /// UClass から情報を取得
     pub(super) fn get_class_info_impl(&self, class_addr: usize) -> Result<ClassInfo> {
-        let name = self.get_object_name_impl(class_addr)?;
+        // デバッグ: 最初の数回だけログ出力
+        static CALL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let count = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let should_log = count < 5;
+
+        let name = match self.get_object_name_impl(class_addr) {
+            Ok(n) => n,
+            Err(e) => {
+                if should_log {
+                    tracing::warn!("get_class_info_impl: get_object_name failed for 0x{:X}: {}", class_addr, e);
+                }
+                return Err(e);
+            }
+        };
+
+        if should_log {
+            tracing::info!("get_class_info_impl: class at 0x{:X} has name '{}'", class_addr, name);
+        }
+
         let handle = unsafe { std::mem::transmute::<usize, WinHandle>(self.process_handle) };
 
-        let ustruct = UStruct::read(handle, class_addr)?;
+        let ustruct = match UStruct::read(handle, class_addr) {
+            Ok(u) => u,
+            Err(e) => {
+                if should_log {
+                    tracing::warn!("get_class_info_impl: UStruct::read failed for 0x{:X}: {}", class_addr, e);
+                }
+                return Err(EngineError::InitializationFailed(format!("UStruct read failed: {}", e)));
+            }
+        };
 
         Ok(ClassInfo {
             name,
@@ -35,16 +61,36 @@ impl UnrealEngine {
         let all_objects = self.get_all_objects_impl()?;
         let handle = unsafe { std::mem::transmute::<usize, WinHandle>(self.process_handle) };
 
-        let mut classes = Vec::new();
+        tracing::info!("enumerate_classes_impl: checking {} objects", all_objects.len());
 
-        for obj_addr in all_objects {
-            // UClass かどうかをチェック
+        let mut classes = Vec::new();
+        let mut valid_obj_count = 0;
+        let mut has_class_count = 0;
+        let mut class_read_ok_count = 0;
+        let mut is_class_count = 0;
+
+        // Debug: show first few objects
+        for (i, &obj_addr) in all_objects.iter().take(5).enumerate() {
             if let Ok(obj) = UObject::read(handle, obj_addr) {
+                tracing::info!("  Object[{}] at 0x{:X}: vtable=0x{:X}, class=0x{:X}, name_idx={}, outer=0x{:X}",
+                    i, obj_addr, obj.vtable, obj.class, obj.name.comparison_index, obj.outer);
+            } else {
+                tracing::warn!("  Object[{}] at 0x{:X}: failed to read", i, obj_addr);
+            }
+        }
+
+        for obj_addr in &all_objects {
+            // UClass かどうかをチェック
+            if let Ok(obj) = UObject::read(handle, *obj_addr) {
+                valid_obj_count += 1;
                 if obj.class != 0 {
+                    has_class_count += 1;
                     if let Ok(class_obj) = UObject::read(handle, obj.class) {
+                        class_read_ok_count += 1;
                         // Class->Class == Class なら UClass
                         if class_obj.class == obj.class {
-                            if let Ok(info) = self.get_class_info_impl(obj_addr) {
+                            is_class_count += 1;
+                            if let Ok(info) = self.get_class_info_impl(*obj_addr) {
                                 classes.push(info);
                             }
                         }
@@ -52,6 +98,9 @@ impl UnrealEngine {
                 }
             }
         }
+
+        tracing::info!("enumerate_classes_impl stats: valid_obj={}, has_class={}, class_read_ok={}, is_class={}, final={}",
+            valid_obj_count, has_class_count, class_read_ok_count, is_class_count, classes.len());
 
         Ok(classes)
     }

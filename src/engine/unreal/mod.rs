@@ -183,54 +183,13 @@ impl UnrealEngine {
     }
 
     /// GObjectsの実際の値を更新
+    /// find_gobjects_impl がブルートフォース方式で検証済みアドレスを返すため、
+    /// ここでは単純にそのアドレスを使用する
     fn refresh_gobjects(&mut self) -> Result<()> {
-        use crate::platform::windows::read_process_memory;
-        use windows::Win32::Foundation::HANDLE as WinHandle;
-
-        let handle = unsafe { std::mem::transmute::<usize, WinHandle>(self.process_handle) };
-
-        // まず、ポインタのアドレスで実際のバイトデータを確認
-        let ptr_data = read_process_memory(handle, self.gobjects_ptr, 8)?;
-        tracing::info!("Reading GObjects pointer at 0x{:X}: {:02X?}", self.gobjects_ptr, ptr_data);
-
-        let gobjects = usize::from_le_bytes(ptr_data[..8].try_into().unwrap());
-
-        if gobjects == 0 {
-            // 初期化が遅延している可能性があるので、再スキャンを試みる
-            tracing::warn!("Pointer at 0x{:X} is null. Trying to find a non-null GObjects pointer...", self.gobjects_ptr);
-
-            // 再スキャンして、nullでないポインタを探す
-            match self.find_gobjects_impl() {
-                Ok(new_gobjects_ptr) => {
-                    self.gobjects_ptr = new_gobjects_ptr;
-                    tracing::info!("Found new GObjects pointer at 0x{:X}", new_gobjects_ptr);
-
-                    // 再度読み取り
-                    let ptr_data = read_process_memory(handle, self.gobjects_ptr, 8)?;
-                    let gobjects = usize::from_le_bytes(ptr_data[..8].try_into().unwrap());
-
-                    if gobjects == 0 {
-                        return Err(EngineError::InitializationFailed(
-                            format!("GObjects pointer at 0x{:X} is still null. The game may not be fully loaded yet.", self.gobjects_ptr),
-                        ));
-                    }
-
-                    self.gobjects = gobjects;
-                    tracing::info!("GObjects value: 0x{:X}", gobjects);
-                    return Ok(());
-                }
-                Err(_) => {
-                    // 再スキャンに失敗 - nullのまま進む
-                    tracing::warn!("Re-scan failed. GObjects may not be initialized yet.");
-                    return Err(EngineError::InitializationFailed(
-                        format!("GObjects not initialized yet (pointer is null at 0x{:X}). Try again after the game fully loads.", self.gobjects_ptr),
-                    ));
-                }
-            }
-        }
-
-        self.gobjects = gobjects;
-        tracing::info!("GObjects value: 0x{:X}", gobjects);
+        // find_gobjects_impl は既に実際にUObjectが読めることを確認済みのアドレスを返す
+        // そのため追加検証は不要で、そのまま使用する
+        tracing::info!("Using GObjects at 0x{:X} (pre-validated by find_gobjects_impl)", self.gobjects_ptr);
+        self.gobjects = self.gobjects_ptr;
         Ok(())
     }
 }
@@ -258,15 +217,17 @@ impl GameEngine for UnrealEngine {
 
         tracing::info!("Module: {} at 0x{:X} (size: 0x{:X})", module.name, self.module_base, self.module_size);
 
-        // GNames, GObjects, ProcessEvent を検索
-        self.gnames_ptr = self.find_gnames()?;
+        // GObjects を先に検索（ヒープアドレス推定に使用）
         self.gobjects_ptr = self.find_gobjects()?;
+        self.refresh_gobjects()?;
+
+        // GNames を検索（GObjects のヒープアドレスを参考にする）
+        self.gnames_ptr = self.find_gnames()?;
+        self.refresh_gnames()?;
+
+        // ProcessEvent を検索
         self.process_event = self.find_process_event()?;
         self.version = self.detect_version();
-
-        // GNamesの実際の値を読み取る
-        self.refresh_gnames()?;
-        self.refresh_gobjects()?;
 
         self.initialized = true;
         Ok(())
