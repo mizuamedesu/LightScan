@@ -1,6 +1,6 @@
 /// Method enumeration and invocation
 
-use super::structures::{FField, UObject, UStruct};
+use super::structures::{FField, FFieldClass, UObject, UStruct};
 use super::{EngineError, Result, UnrealEngine};
 use crate::engine::types::{
     ClassHandle, ClassInfo, FieldHandle, FieldInfo, InstanceHandle, MethodHandle, MethodInfo,
@@ -152,13 +152,31 @@ impl UnrealEngine {
         let mut return_type = None;
         let mut current_prop = ustruct.child_properties;
 
+        // デバッグログ（メソッド情報用のカウンタ）
+        static METHOD_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let should_log = METHOD_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20;
+        if should_log {
+            tracing::info!(
+                "get_method_info_impl: method='{}' addr=0x{:X} child_properties=0x{:X} super=0x{:X} children=0x{:X}",
+                name, method_addr, current_prop, ustruct.super_struct, ustruct.children
+            );
+        }
+
         // FProperty リンクリストを辿る
         let mut count = 0;
+        let mut param_count = 0;
         while current_prop != 0 && count < 100 {
             count += 1;
 
             if let Ok(field) = FField::read(handle_win, current_prop) {
                 if let Ok(prop_name) = self.get_fname_impl(field.name.comparison_index) {
+                    param_count += 1;
+                    if should_log {
+                        tracing::info!(
+                            "  param {}: '{}' class_private=0x{:X} next=0x{:X}",
+                            param_count, prop_name, field.class_private, field.next
+                        );
+                    }
                     // CPF_ReturnParm (0x0400) フラグをチェック
                     // FProperty::PropertyFlags は FField の後に続く
                     // FField(48バイト) + ArrayDim(4) + ElementSize(4) + PropertyFlags(8) = offset 56
@@ -170,8 +188,8 @@ impl UnrealEngine {
                         false
                     };
 
-                    // プロパティの型情報を推測（名前から）
-                    let type_info = self.guess_type_from_property_name(&prop_name);
+                    // FFieldClass から実際の型情報を取得
+                    let type_info = self.get_property_type_info(handle_win, current_prop, &field);
 
                     if is_return_param {
                         return_type = Some(type_info);
@@ -186,6 +204,10 @@ impl UnrealEngine {
             } else {
                 break;
             }
+        }
+
+        if should_log {
+            tracing::info!("  total params: {}, return_type: {:?}", params.len(), return_type.as_ref().map(|t| &t.name));
         }
 
         // FUNC_Static (0x00000002) フラグをチェック
@@ -211,27 +233,98 @@ impl UnrealEngine {
         })
     }
 
-    /// プロパティ名から型を推測
-    fn guess_type_from_property_name(&self, name: &str) -> TypeInfo {
-        // 一般的なUE型名のパターンマッチ
-        let name_lower = name.to_lowercase();
-
-        let (type_name, size, kind) = if name_lower.contains("bool") || name_lower.starts_with("b") && name.len() > 1 && name.chars().nth(1).map(|c| c.is_uppercase()).unwrap_or(false) {
-            ("bool", 1, TypeKind::Primitive(PrimitiveType::Bool))
-        } else if name_lower.contains("int32") || name_lower.contains("int") {
-            ("int32", 4, TypeKind::Primitive(PrimitiveType::I32))
-        } else if name_lower.contains("float") {
-            ("float", 4, TypeKind::Primitive(PrimitiveType::F32))
-        } else if name_lower.contains("double") {
-            ("double", 8, TypeKind::Primitive(PrimitiveType::F64))
-        } else if name_lower.contains("string") || name_lower.contains("name") || name_lower.contains("text") {
-            ("FString", 16, TypeKind::Unknown) // FString は複雑な構造
-        } else if name_lower.contains("vector") {
-            ("FVector", 12, TypeKind::Unknown) // FVector = 3 floats
-        } else if name_lower.contains("rotator") {
-            ("FRotator", 12, TypeKind::Unknown)
+    /// FFieldClass から実際の型情報を取得
+    fn get_property_type_info(&self, handle: WinHandle, prop_addr: usize, field: &FField) -> TypeInfo {
+        // FFieldClass から型名を取得
+        let type_class_name = if field.class_private != 0 {
+            FFieldClass::read_type_name(handle, field.class_private, |idx| {
+                self.get_fname_impl(idx).map_err(|e| anyhow::anyhow!("{}", e))
+            })
+            .unwrap_or_else(|_| "unknown".to_string())
         } else {
-            ("unknown", 8, TypeKind::Unknown) // デフォルトはポインタサイズ
+            "unknown".to_string()
+        };
+
+        // FProperty::ElementSize を読み取る (FField(48) + ArrayDim(4) の後)
+        let element_size_offset = 48usize + 4;
+        let element_size = if let Ok(data) = read_process_memory(handle, prop_addr + element_size_offset, 4) {
+            i32::from_le_bytes(data[..4].try_into().unwrap()) as usize
+        } else {
+            0
+        };
+
+        // 型クラス名から TypeInfo を生成
+        self.property_class_to_type_info(&type_class_name, element_size)
+    }
+
+    /// プロパティクラス名から TypeInfo を生成
+    fn property_class_to_type_info(&self, class_name: &str, element_size: usize) -> TypeInfo {
+        // UE のプロパティクラス名から型を判定
+        let (type_name, size, kind) = match class_name {
+            // 整数型
+            "Int8Property" => ("int8", 1, TypeKind::Primitive(PrimitiveType::I8)),
+            "Int16Property" => ("int16", 2, TypeKind::Primitive(PrimitiveType::I16)),
+            "IntProperty" | "Int32Property" => ("int32", 4, TypeKind::Primitive(PrimitiveType::I32)),
+            "Int64Property" => ("int64", 8, TypeKind::Primitive(PrimitiveType::I64)),
+
+            // 符号なし整数
+            "ByteProperty" | "UInt8Property" => ("uint8", 1, TypeKind::Primitive(PrimitiveType::U8)),
+            "UInt16Property" => ("uint16", 2, TypeKind::Primitive(PrimitiveType::U16)),
+            "UInt32Property" => ("uint32", 4, TypeKind::Primitive(PrimitiveType::U32)),
+            "UInt64Property" => ("uint64", 8, TypeKind::Primitive(PrimitiveType::U64)),
+
+            // 浮動小数点
+            "FloatProperty" => ("float", 4, TypeKind::Primitive(PrimitiveType::F32)),
+            "DoubleProperty" => ("double", 8, TypeKind::Primitive(PrimitiveType::F64)),
+
+            // ブール
+            "BoolProperty" => ("bool", 1, TypeKind::Primitive(PrimitiveType::Bool)),
+
+            // 文字列系
+            "StrProperty" => ("FString", 16, TypeKind::Unknown),
+            "NameProperty" => ("FName", 8, TypeKind::Unknown),
+            "TextProperty" => ("FText", 24, TypeKind::Unknown),
+
+            // オブジェクト参照
+            "ObjectProperty" | "ObjectPtrProperty" => ("UObject*", 8, TypeKind::Pointer(Box::new(TypeInfo {
+                name: "UObject".to_string(),
+                size: 8,
+                kind: TypeKind::Unknown,
+            }))),
+            "ClassProperty" | "ClassPtrProperty" => ("UClass*", 8, TypeKind::Pointer(Box::new(TypeInfo {
+                name: "UClass".to_string(),
+                size: 8,
+                kind: TypeKind::Unknown,
+            }))),
+            "SoftObjectProperty" => ("TSoftObjectPtr", 24, TypeKind::Unknown),
+            "WeakObjectProperty" => ("TWeakObjectPtr", 8, TypeKind::Unknown),
+            "LazyObjectProperty" => ("TLazyObjectPtr", 8, TypeKind::Unknown),
+            "InterfaceProperty" => ("TScriptInterface", 16, TypeKind::Unknown),
+
+            // 構造体
+            "StructProperty" => ("struct", element_size.max(1), TypeKind::Unknown),
+
+            // 配列
+            "ArrayProperty" => ("TArray", 16, TypeKind::Unknown),
+            "SetProperty" => ("TSet", 80, TypeKind::Unknown),
+            "MapProperty" => ("TMap", 80, TypeKind::Unknown),
+
+            // Enum
+            "EnumProperty" => ("enum", element_size.max(1), TypeKind::Primitive(PrimitiveType::U8)),
+
+            // デリゲート
+            "DelegateProperty" => ("FDelegate", 16, TypeKind::Unknown),
+            "MulticastDelegateProperty" | "MulticastInlineDelegateProperty" | "MulticastSparseDelegateProperty" =>
+                ("FMulticastDelegate", 16, TypeKind::Unknown),
+
+            // ベクトル/変換系
+            name if name.contains("Vector") => ("FVector", 12, TypeKind::Unknown),
+            name if name.contains("Rotator") => ("FRotator", 12, TypeKind::Unknown),
+            name if name.contains("Transform") => ("FTransform", 48, TypeKind::Unknown),
+            name if name.contains("Quat") => ("FQuat", 16, TypeKind::Unknown),
+
+            // 不明
+            _ => (class_name, element_size.max(8), TypeKind::Unknown),
         };
 
         TypeInfo {

@@ -423,6 +423,33 @@ impl FField {
     }
 }
 
+/// FFieldClass - FField の型情報
+/// UE5 では FProperty の具体的な型（IntProperty, FloatProperty など）を示す
+#[repr(C)]
+#[derive(Debug)]
+pub struct FFieldClass {
+    pub name: FName,           // 型名（例: "IntProperty", "FloatProperty"）
+    pub id: u64,               // 一意のID
+    pub cast_flags: u64,       // キャストフラグ
+    pub class_flags: u32,      // クラスフラグ
+    pub super_class: usize,    // 親クラス
+}
+
+impl FFieldClass {
+    /// FFieldClass から型名を取得
+    pub fn read_type_name(handle: HANDLE, class_addr: usize, get_fname: impl Fn(u32) -> Result<String, anyhow::Error>) -> Result<String, anyhow::Error> {
+        if class_addr == 0 {
+            return Ok("unknown".to_string());
+        }
+
+        // FFieldClass の先頭は FName
+        let data = read_process_memory(handle, class_addr, 8)?;
+        let name_index = u32::from_le_bytes(data[0..4].try_into().unwrap());
+
+        get_fname(name_index)
+    }
+}
+
 /// UFunction - 関数情報
 #[repr(C)]
 pub struct UFunction {

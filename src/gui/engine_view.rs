@@ -751,11 +751,21 @@ impl EngineView {
             .filter(|m| filter.is_empty() || m.name.to_lowercase().contains(&filter))
             .filter(|m| !show_bp_only || bp_handles.contains(&m.handle))
             .map(|m| {
+                // 状態を取得するか、パラメータ数に合わせて新規作成
                 let state = self
                     .method_invoke_states
                     .get(&m.handle)
                     .cloned()
-                    .unwrap_or_default();
+                    .map(|mut s| {
+                        // パラメータ数と arg_strings の長さが一致しない場合は調整
+                        if s.arg_strings.len() != m.params.len() {
+                            s.arg_strings = m.params.iter().map(|_| String::new()).collect();
+                        }
+                        s
+                    })
+                    .unwrap_or_else(|| MethodInvokeState {
+                        arg_strings: m.params.iter().map(|_| String::new()).collect(),
+                    });
                 (m.clone(), state)
             })
             .collect();
@@ -784,7 +794,7 @@ impl EngineView {
 
                 // パラメータ入力
                 if !method.params.is_empty() {
-                    ui.label("Parameters:");
+                    ui.label(format!("Parameters ({}):", method.params.len()));
                     ui.indent(format!("params_{}", method.handle.0), |ui| {
                         for (i, param) in method.params.iter().enumerate() {
                             ui.horizontal(|ui| {
@@ -800,6 +810,8 @@ impl EngineView {
                             });
                         }
                     });
+                } else {
+                    ui.label(egui::RichText::new("(no parameters)").italics().weak());
                 }
 
                 // Invoke ボタン
@@ -831,11 +843,24 @@ impl EngineView {
 
         // 引数更新
         for (handle, idx, new_val) in arg_updates {
-            if let Some(state) = self.method_invoke_states.get_mut(&handle) {
-                if idx < state.arg_strings.len() {
-                    state.arg_strings[idx] = new_val;
+            let state = self.method_invoke_states.entry(handle).or_insert_with(|| {
+                // 対応するメソッドを探してパラメータ数を取得
+                let param_count = self
+                    .instance_methods
+                    .iter()
+                    .find(|m| m.handle == handle)
+                    .map(|m| m.params.len())
+                    .unwrap_or(0);
+                MethodInvokeState {
+                    arg_strings: vec![String::new(); param_count],
                 }
+            });
+
+            // インデックスが範囲外なら拡張
+            while state.arg_strings.len() <= idx {
+                state.arg_strings.push(String::new());
             }
+            state.arg_strings[idx] = new_val;
         }
 
         // パースエラーがあれば表示
