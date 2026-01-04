@@ -2,7 +2,10 @@
 
 use super::structures::{FField, UObject, UStruct};
 use super::{EngineError, Result, UnrealEngine};
-use crate::engine::types::*;
+use crate::engine::types::{
+    ClassHandle, ClassInfo, FieldHandle, FieldInfo, InstanceHandle, MethodHandle, MethodInfo,
+    ParamInfo, PrimitiveType, TypeInfo, TypeKind, Value,
+};
 use crate::platform::windows::{read_process_memory, write_process_memory};
 use windows::Win32::Foundation::HANDLE as WinHandle;
 use windows::Win32::System::Threading::{
@@ -138,16 +141,104 @@ impl UnrealEngine {
     /// UFunction から情報を取得
     pub(super) fn get_method_info_impl(&self, method_addr: usize) -> Result<MethodInfo> {
         let name = self.get_object_name_impl(method_addr)?;
+        let handle_win = unsafe { std::mem::transmute::<usize, WinHandle>(self.process_handle) };
 
-        // TODO: パラメータ情報を読み取る
+        // UFunction のパラメータ情報を読み取る
+        // UFunction は UStruct を継承しているので、ChildProperties からパラメータを取得
+        let ustruct = UStruct::read(handle_win, method_addr)
+            .map_err(|e| EngineError::MemoryError(format!("Failed to read UFunction struct: {}", e)))?;
+
+        let mut params = Vec::new();
+        let mut return_type = None;
+        let mut current_prop = ustruct.child_properties;
+
+        // FProperty リンクリストを辿る
+        let mut count = 0;
+        while current_prop != 0 && count < 100 {
+            count += 1;
+
+            if let Ok(field) = FField::read(handle_win, current_prop) {
+                if let Ok(prop_name) = self.get_fname_impl(field.name.comparison_index) {
+                    // CPF_ReturnParm (0x0400) フラグをチェック
+                    // FProperty::PropertyFlags は FField の後に続く
+                    // FField(48バイト) + ArrayDim(4) + ElementSize(4) + PropertyFlags(8) = offset 56
+                    let prop_flags_offset = 48usize + 4 + 4; // FField + ArrayDim + ElementSize
+                    let is_return_param = if let Ok(flags_data) = read_process_memory(handle_win, current_prop + prop_flags_offset, 8) {
+                        let prop_flags = u64::from_le_bytes(flags_data[..8].try_into().unwrap());
+                        (prop_flags & 0x0400) != 0 // CPF_ReturnParm
+                    } else {
+                        false
+                    };
+
+                    // プロパティの型情報を推測（名前から）
+                    let type_info = self.guess_type_from_property_name(&prop_name);
+
+                    if is_return_param {
+                        return_type = Some(type_info);
+                    } else {
+                        params.push(ParamInfo {
+                            name: prop_name,
+                            type_info,
+                        });
+                    }
+                }
+                current_prop = field.next;
+            } else {
+                break;
+            }
+        }
+
+        // FUNC_Static (0x00000002) フラグをチェック
+        // UFunction::FunctionFlags のオフセットを試す
+        let function_flags_offsets = [0x88usize, 0x90, 0x98, 0xA0, 0xB0];
+        let mut is_static = false;
+        for &offset in &function_flags_offsets {
+            if let Ok(data) = read_process_memory(handle_win, method_addr + offset, 4) {
+                let flags = u32::from_le_bytes(data[..4].try_into().unwrap());
+                if flags != 0 && flags < 0x80000000 {
+                    is_static = (flags & 0x00000002) != 0; // FUNC_Static
+                    break;
+                }
+            }
+        }
 
         Ok(MethodInfo {
             name,
             handle: MethodHandle(method_addr),
-            params: Vec::new(),
-            return_type: None,
-            is_static: false,
+            params,
+            return_type,
+            is_static,
         })
+    }
+
+    /// プロパティ名から型を推測
+    fn guess_type_from_property_name(&self, name: &str) -> TypeInfo {
+        // 一般的なUE型名のパターンマッチ
+        let name_lower = name.to_lowercase();
+
+        let (type_name, size, kind) = if name_lower.contains("bool") || name_lower.starts_with("b") && name.len() > 1 && name.chars().nth(1).map(|c| c.is_uppercase()).unwrap_or(false) {
+            ("bool", 1, TypeKind::Primitive(PrimitiveType::Bool))
+        } else if name_lower.contains("int32") || name_lower.contains("int") {
+            ("int32", 4, TypeKind::Primitive(PrimitiveType::I32))
+        } else if name_lower.contains("float") {
+            ("float", 4, TypeKind::Primitive(PrimitiveType::F32))
+        } else if name_lower.contains("double") {
+            ("double", 8, TypeKind::Primitive(PrimitiveType::F64))
+        } else if name_lower.contains("string") || name_lower.contains("name") || name_lower.contains("text") {
+            ("FString", 16, TypeKind::Unknown) // FString は複雑な構造
+        } else if name_lower.contains("vector") {
+            ("FVector", 12, TypeKind::Unknown) // FVector = 3 floats
+        } else if name_lower.contains("rotator") {
+            ("FRotator", 12, TypeKind::Unknown)
+        } else {
+            ("unknown", 8, TypeKind::Unknown) // デフォルトはポインタサイズ
+        };
+
+        TypeInfo {
+            name: type_name.to_string(),
+            size,
+            kind,
+        }
     }
 
     /// UClass のすべてのメソッドを列挙
@@ -205,12 +296,25 @@ impl UnrealEngine {
         &self,
         instance_addr: usize,
         method_addr: usize,
-        _args: &[Value],
+        args: &[Value],
     ) -> Result<Value> {
         let handle = unsafe { std::mem::transmute::<usize, WinHandle>(self.process_handle) };
 
+        // UFunction からパラメータ情報を取得
+        let method_info = self.get_method_info_impl(method_addr)?;
+
+        // UFunction の ParamsSize を読み取る
+        // UStruct を継承しているので PropertiesSize がパラメータ構造体のサイズ
+        let ustruct = UStruct::read(handle, method_addr)
+            .map_err(|e| EngineError::MemoryError(format!("Failed to read UFunction: {}", e)))?;
+
+        let params_size = if ustruct.properties_size > 0 {
+            ustruct.properties_size as usize
+        } else {
+            0x100 // フォールバック
+        };
+
         // パラメータ構造体を確保
-        let params_size = 0x100; // 仮のサイズ
         let params_addr = unsafe {
             VirtualAllocEx(
                 handle,
@@ -227,7 +331,13 @@ impl UnrealEngine {
             ));
         }
 
-        // TODO: args を params に書き込む
+        // 引数を params に書き込む
+        if let Err(e) = self.write_args_to_params(handle, params_addr as usize, method_addr, args) {
+            unsafe {
+                VirtualFreeEx(handle, params_addr, 0, MEM_RELEASE);
+            }
+            return Err(e);
+        }
 
         // シェルコードを生成して ProcessEvent を呼び出す
         // ProcessEvent(UObject* Context, UFunction* Function, void* Params)
@@ -277,7 +387,8 @@ impl UnrealEngine {
                 WaitForSingleObject(thread_handle, INFINITE);
             }
 
-            // TODO: 戻り値を読み取る
+            // 戻り値を読み取る
+            let return_value = self.read_return_value(handle, params_addr as usize, method_addr, &method_info)?;
 
             // クリーンアップ
             unsafe {
@@ -285,7 +396,7 @@ impl UnrealEngine {
                 VirtualFreeEx(handle, shellcode_addr, 0, MEM_RELEASE);
             }
 
-            Ok(Value::Null)
+            Ok(return_value)
         } else {
             unsafe {
                 VirtualFreeEx(handle, params_addr, 0, MEM_RELEASE);
@@ -295,6 +406,171 @@ impl UnrealEngine {
                 "Failed to create remote thread".into(),
             ))
         }
+    }
+
+    /// 引数をパラメータ構造体に書き込む
+    fn write_args_to_params(
+        &self,
+        handle: WinHandle,
+        params_addr: usize,
+        method_addr: usize,
+        args: &[Value],
+    ) -> Result<()> {
+        // UFunction の ChildProperties からパラメータプロパティを取得
+        let ustruct = UStruct::read(handle, method_addr)
+            .map_err(|e| EngineError::MemoryError(format!("Failed to read UFunction: {}", e)))?;
+
+        let mut current_prop = ustruct.child_properties;
+        let mut arg_index = 0;
+
+        while current_prop != 0 && arg_index < args.len() {
+            if let Ok(field) = FField::read(handle, current_prop) {
+                // CPF_ReturnParm (0x0400) をスキップ
+                let prop_flags_offset = 48usize + 4 + 4;
+                let is_return = if let Ok(flags_data) = read_process_memory(handle, current_prop + prop_flags_offset, 8) {
+                    let prop_flags = u64::from_le_bytes(flags_data[..8].try_into().unwrap());
+                    (prop_flags & 0x0400) != 0
+                } else {
+                    false
+                };
+
+                if !is_return {
+                    // プロパティのオフセットを取得
+                    // FProperty::Offset_Internal は FField(48) + ArrayDim(4) + ElementSize(4) + PropertyFlags(8) + RepIndex(2) + padding(2) = 68
+                    let offset_field_offset = 68usize;
+                    if let Ok(offset_data) = read_process_memory(handle, current_prop + offset_field_offset, 4) {
+                        let prop_offset = i32::from_le_bytes(offset_data[..4].try_into().unwrap()) as usize;
+
+                        // 値をシリアライズして書き込み
+                        let data = self.serialize_value(&args[arg_index]);
+                        write_process_memory(handle, params_addr + prop_offset, &data)?;
+                    }
+                    arg_index += 1;
+                }
+
+                current_prop = field.next;
+            } else {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Value をバイト列にシリアライズ
+    fn serialize_value(&self, value: &Value) -> Vec<u8> {
+        match value {
+            Value::Null => vec![0; 8],
+            Value::Bool(v) => vec![if *v { 1u8 } else { 0u8 }],
+            Value::I8(v) => v.to_le_bytes().to_vec(),
+            Value::I16(v) => v.to_le_bytes().to_vec(),
+            Value::I32(v) => v.to_le_bytes().to_vec(),
+            Value::I64(v) => v.to_le_bytes().to_vec(),
+            Value::U8(v) => v.to_le_bytes().to_vec(),
+            Value::U16(v) => v.to_le_bytes().to_vec(),
+            Value::U32(v) => v.to_le_bytes().to_vec(),
+            Value::U64(v) => v.to_le_bytes().to_vec(),
+            Value::F32(v) => v.to_le_bytes().to_vec(),
+            Value::F64(v) => v.to_le_bytes().to_vec(),
+            Value::String(_) => vec![0; 16], // FString は複雑なので未サポート
+            Value::Object(h) => h.0.to_le_bytes().to_vec(),
+            Value::Array(_) => vec![0; 16], // TArray は複雑なので未サポート
+            Value::Struct(data) => data.clone(),
+        }
+    }
+
+    /// 戻り値をパラメータ構造体から読み取る
+    fn read_return_value(
+        &self,
+        handle: WinHandle,
+        params_addr: usize,
+        method_addr: usize,
+        method_info: &MethodInfo,
+    ) -> Result<Value> {
+        // 戻り値がない場合
+        if method_info.return_type.is_none() {
+            return Ok(Value::Null);
+        }
+
+        // UFunction の ReturnValueOffset を取得
+        // UFunction 固有フィールドのオフセットを試す
+        let return_offset_offsets = [0x8Cusize, 0x94, 0x9C, 0xA4];
+
+        let mut return_value_offset = None;
+        for &offset in &return_offset_offsets {
+            if let Ok(data) = read_process_memory(handle, method_addr + offset, 2) {
+                let ret_offset = u16::from_le_bytes(data[..2].try_into().unwrap()) as usize;
+                // 妥当なオフセット値かチェック
+                if ret_offset < 0x1000 {
+                    return_value_offset = Some(ret_offset);
+                    break;
+                }
+            }
+        }
+
+        // ReturnValueOffset が見つからない場合、ChildProperties から探す
+        let return_offset = if let Some(offset) = return_value_offset {
+            offset
+        } else {
+            // 最後のプロパティ（通常はReturnValue）のオフセットを使用
+            let ustruct = UStruct::read(handle, method_addr)
+                .map_err(|e| EngineError::MemoryError(format!("Failed to read UFunction: {}", e)))?;
+
+            let mut current_prop = ustruct.child_properties;
+            let mut last_return_offset = 0usize;
+
+            while current_prop != 0 {
+                if let Ok(field) = FField::read(handle, current_prop) {
+                    let prop_flags_offset = 48usize + 4 + 4;
+                    if let Ok(flags_data) = read_process_memory(handle, current_prop + prop_flags_offset, 8) {
+                        let prop_flags = u64::from_le_bytes(flags_data[..8].try_into().unwrap());
+                        if (prop_flags & 0x0400) != 0 {
+                            // CPF_ReturnParm
+                            let offset_field_offset = 68usize;
+                            if let Ok(offset_data) = read_process_memory(handle, current_prop + offset_field_offset, 4) {
+                                last_return_offset = i32::from_le_bytes(offset_data[..4].try_into().unwrap()) as usize;
+                            }
+                        }
+                    }
+                    current_prop = field.next;
+                } else {
+                    break;
+                }
+            }
+            last_return_offset
+        };
+
+        // 戻り値を読み取る
+        let return_type = method_info.return_type.as_ref().unwrap();
+        let data = read_process_memory(handle, params_addr + return_offset, return_type.size.max(8))?;
+
+        // 型に応じてデシリアライズ
+        let value = match &return_type.kind {
+            TypeKind::Primitive(prim) => match prim {
+                PrimitiveType::Bool => Value::Bool(data[0] != 0),
+                PrimitiveType::I8 => Value::I8(data[0] as i8),
+                PrimitiveType::I16 => Value::I16(i16::from_le_bytes(data[..2].try_into().unwrap())),
+                PrimitiveType::I32 => Value::I32(i32::from_le_bytes(data[..4].try_into().unwrap())),
+                PrimitiveType::I64 => Value::I64(i64::from_le_bytes(data[..8].try_into().unwrap())),
+                PrimitiveType::U8 => Value::U8(data[0]),
+                PrimitiveType::U16 => Value::U16(u16::from_le_bytes(data[..2].try_into().unwrap())),
+                PrimitiveType::U32 => Value::U32(u32::from_le_bytes(data[..4].try_into().unwrap())),
+                PrimitiveType::U64 => Value::U64(u64::from_le_bytes(data[..8].try_into().unwrap())),
+                PrimitiveType::F32 => Value::F32(f32::from_le_bytes(data[..4].try_into().unwrap())),
+                PrimitiveType::F64 => Value::F64(f64::from_le_bytes(data[..8].try_into().unwrap())),
+            },
+            TypeKind::Class(_) | TypeKind::Pointer(_) => {
+                let ptr = usize::from_le_bytes(data[..8].try_into().unwrap());
+                if ptr == 0 {
+                    Value::Null
+                } else {
+                    Value::Object(InstanceHandle(ptr))
+                }
+            }
+            _ => Value::Struct(data[..return_type.size.max(1)].to_vec()),
+        };
+
+        Ok(value)
     }
 
     /// ProcessEvent 呼び出し用のシェルコードを生成

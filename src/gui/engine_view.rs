@@ -69,6 +69,9 @@ pub struct EngineView {
     /// 選択されたインスタンスのメソッド一覧
     instance_methods: Vec<MethodInfo>,
 
+    /// Blueprint関数のハンドルセット
+    blueprint_method_handles: std::collections::HashSet<MethodHandle>,
+
     /// メソッドごとの引数入力状態（MethodHandle -> MethodInvokeState）
     method_invoke_states: HashMap<MethodHandle, MethodInvokeState>,
 
@@ -80,6 +83,12 @@ pub struct EngineView {
 
     /// 最後のメソッド呼び出し結果
     last_invoke_result: Option<String>,
+
+    /// 選択されたインスタンスのクラス名
+    selected_instance_class_name: Option<String>,
+
+    /// Blueprint関数のみ表示フラグ
+    show_blueprint_only: bool,
 }
 
 impl Default for EngineView {
@@ -103,10 +112,13 @@ impl Default for EngineView {
             field_filter: String::new(),
             instance_properties: HashMap::new(),
             instance_methods: Vec::new(),
+            blueprint_method_handles: std::collections::HashSet::new(),
             method_invoke_states: HashMap::new(),
             instance_method_filter: String::new(),
             instance_property_filter: String::new(),
             last_invoke_result: None,
+            selected_instance_class_name: None,
+            show_blueprint_only: false,
         }
     }
 }
@@ -121,8 +133,11 @@ impl EngineView {
         self.instances.clear();
         self.instance_properties.clear();
         self.instance_methods.clear();
+        self.blueprint_method_handles.clear();
         self.method_invoke_states.clear();
         self.selected_instance = None;
+        self.selected_instance_class_name = None;
+        self.show_blueprint_only = false;
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -134,6 +149,16 @@ impl EngineView {
             return;
         }
 
+        // 全体をスクロール可能にする
+        egui::ScrollArea::vertical()
+            .id_salt("engine_view_main_scroll")
+            .show(ui, |ui| {
+                self.render_main_ui(ui);
+            });
+    }
+
+    /// メインUIを描画（スクロール内部）
+    fn render_main_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Engine Abstraction");
         ui.separator();
 
@@ -488,6 +513,14 @@ impl EngineView {
             return;
         };
 
+        // インスタンスのクラス名を取得
+        self.selected_instance_class_name = None;
+        if let Ok(instance_class) = eng.get_instance_class(instance) {
+            if let Ok(class_info) = eng.get_class_info(instance_class) {
+                self.selected_instance_class_name = Some(class_info.name);
+            }
+        }
+
         // プロパティ値をロード
         self.instance_properties.clear();
         for field in &self.fields {
@@ -528,10 +561,21 @@ impl EngineView {
             }
         }
 
+        // Blueprint関数リストを取得（UnrealEngine固有機能）
+        self.blueprint_method_handles.clear();
+        if let Some(ue) = eng.as_any().downcast_ref::<crate::engine::unreal::UnrealEngine>() {
+            if let Ok(bp_methods) = ue.enumerate_blueprint_functions(class) {
+                for method in bp_methods {
+                    self.blueprint_method_handles.insert(method.handle);
+                }
+            }
+        }
+
         self.status_message = format!(
-            "Loaded {} properties, {} methods for instance @ 0x{:X}",
+            "Loaded {} properties, {} methods ({} blueprint) for instance @ 0x{:X}",
             self.instance_properties.len(),
             self.instance_methods.len(),
+            self.blueprint_method_handles.len(),
             instance.0
         );
     }
@@ -539,6 +583,14 @@ impl EngineView {
     /// インスタンス詳細パネルを描画
     fn render_instance_detail_panel(&mut self, ui: &mut egui::Ui, instance: InstanceHandle) {
         ui.heading(format!("Instance Detail @ 0x{:X}", instance.0));
+
+        // クラス名を表示
+        if let Some(class_name) = &self.selected_instance_class_name {
+            ui.horizontal(|ui| {
+                ui.label("Class:");
+                ui.label(egui::RichText::new(class_name).strong().color(egui::Color32::LIGHT_BLUE));
+            });
+        }
 
         ui.horizontal(|ui| {
             if ui.button("Refresh Values").clicked() {
@@ -572,6 +624,7 @@ impl EngineView {
             ui.horizontal(|ui| {
                 ui.label("Filter:");
                 ui.text_edit_singleline(&mut self.instance_method_filter);
+                ui.checkbox(&mut self.show_blueprint_only, "Blueprint Only");
             });
 
             ui.label(format!("{} methods available", self.instance_methods.len()));
@@ -688,12 +741,15 @@ impl EngineView {
     /// メソッド呼び出しUIを描画
     fn render_methods_invoker(&mut self, ui: &mut egui::Ui, instance: InstanceHandle) {
         let filter = self.instance_method_filter.to_lowercase();
+        let show_bp_only = self.show_blueprint_only;
+        let bp_handles = &self.blueprint_method_handles;
 
         // メソッドと引数状態を事前にクローンして借用問題を回避
         let methods_with_state: Vec<_> = self
             .instance_methods
             .iter()
             .filter(|m| filter.is_empty() || m.name.to_lowercase().contains(&filter))
+            .filter(|m| !show_bp_only || bp_handles.contains(&m.handle))
             .map(|m| {
                 let state = self
                     .method_invoke_states
@@ -710,9 +766,14 @@ impl EngineView {
         let mut parse_errors: Vec<String> = Vec::new();
 
         for (method, invoke_state) in &methods_with_state {
+            let is_blueprint = bp_handles.contains(&method.handle);
+
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&method.name).strong());
+                    if is_blueprint {
+                        ui.label(egui::RichText::new("[BP]").color(egui::Color32::LIGHT_GREEN));
+                    }
                     if method.is_static {
                         ui.label("[static]");
                     }

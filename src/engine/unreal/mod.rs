@@ -126,11 +126,47 @@ impl UnrealEngine {
     }
 
     /// UE 固有: Blueprint 関数の一覧を取得
-    pub fn enumerate_blueprint_functions(&self, _class: ClassHandle) -> Result<Vec<MethodInfo>> {
-        // TODO: FUNC_BlueprintCallable フラグを持つ UFunction を列挙
-        Err(EngineError::UnsupportedOperation(
-            "Blueprint enumeration not implemented".into(),
-        ))
+    /// FUNC_BlueprintCallable フラグを持つ UFunction を列挙
+    pub fn enumerate_blueprint_functions(&self, class: ClassHandle) -> Result<Vec<MethodInfo>> {
+        use crate::platform::windows::read_process_memory;
+        use windows::Win32::Foundation::HANDLE as WinHandle;
+
+        let handle = unsafe { std::mem::transmute::<usize, WinHandle>(self.process_handle) };
+
+        // FUNC_BlueprintCallable = 0x04000000
+        const FUNC_BLUEPRINT_CALLABLE: u32 = 0x04000000;
+
+        // UFunction の FunctionFlags オフセット
+        // UObject(40) + UField::Next(8) + UStruct部(可変) の後
+        // 実際には UStruct::read と同様に複数オフセットを試す
+        let function_flags_offsets = [0x88usize, 0x90, 0x98, 0xA0, 0xB0];
+
+        let all_methods = self.enumerate_methods_impl(class.0)?;
+        let mut blueprint_functions = Vec::new();
+
+        for method in all_methods {
+            // UFunction の FunctionFlags を読み取る
+            for &offset in &function_flags_offsets {
+                if let Ok(data) = read_process_memory(handle, method.handle.0 + offset, 4) {
+                    let flags = u32::from_le_bytes(data[..4].try_into().unwrap());
+
+                    // 妥当なフラグ値かチェック（上位ビットが多すぎないか）
+                    if flags != 0 && flags < 0x80000000 {
+                        if (flags & FUNC_BLUEPRINT_CALLABLE) != 0 {
+                            blueprint_functions.push(method.clone());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "enumerate_blueprint_functions: found {} blueprint callable functions",
+            blueprint_functions.len()
+        );
+
+        Ok(blueprint_functions)
     }
 
     /// UE 固有: コンソールコマンド実行
@@ -284,11 +320,26 @@ impl GameEngine for UnrealEngine {
         self.get_instances_impl(class.0)
     }
 
-    fn get_instance_class(&self, _instance: InstanceHandle) -> Result<ClassHandle> {
-        // TODO: UObject->Class を読み取る
-        Err(EngineError::UnsupportedOperation(
-            "Instance class reading not implemented".into(),
-        ))
+    fn get_instance_class(&self, instance: InstanceHandle) -> Result<ClassHandle> {
+        use crate::platform::windows::read_process_memory;
+        use windows::Win32::Foundation::HANDLE as WinHandle;
+
+        let handle = unsafe { std::mem::transmute::<usize, WinHandle>(self.process_handle) };
+
+        // UObject の class フィールドを読み取る
+        // UObject レイアウト: vtable(8) + flags(4) + index(4) + class(8)
+        // class は offset 16 にある
+        let class_offset = 16usize;
+        let data = read_process_memory(handle, instance.0 + class_offset, 8)
+            .map_err(|e| EngineError::MemoryError(format!("Failed to read class pointer: {}", e)))?;
+
+        let class_addr = usize::from_le_bytes(data[..8].try_into().unwrap());
+
+        if class_addr == 0 {
+            return Err(EngineError::InvalidArgument("Instance has null class".into()));
+        }
+
+        Ok(ClassHandle(class_addr))
     }
 
     fn invoke(
