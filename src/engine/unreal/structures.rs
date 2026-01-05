@@ -437,16 +437,178 @@ pub struct FFieldClass {
 
 impl FFieldClass {
     /// FFieldClass から型名を取得
+    /// UE5 の FFieldClass 構造体レイアウト:
+    /// - Name (FName) at offset 0
+    /// - Id (uint64) at offset 8
+    /// - CastFlags (uint64) at offset 16
+    /// - ClassFlags (EClassFlags) at offset 24
+    /// - SuperClass (FFieldClass*) at offset 32
+    ///
+    /// UE5.5 の静的 FFieldClass インスタンス:
+    /// FFieldClass は .data セクションに静的に配置される
+    /// 名前は FName で、comparison_index がグローバル名前テーブルを参照
     pub fn read_type_name(handle: HANDLE, class_addr: usize, get_fname: impl Fn(u32) -> Result<String, anyhow::Error>) -> Result<String, anyhow::Error> {
         if class_addr == 0 {
             return Ok("unknown".to_string());
         }
 
-        // FFieldClass の先頭は FName
-        let data = read_process_memory(handle, class_addr, 8)?;
-        let name_index = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        // まず 64 バイト読み取って複数のオフセットを試す
+        let data = read_process_memory(handle, class_addr, 64)?;
 
-        get_fname(name_index)
+        // デバッグログ（最初の数回だけ）
+        static DEBUG_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let should_log = DEBUG_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10;
+        if should_log {
+            tracing::debug!("FFieldClass raw at 0x{:X}:", class_addr);
+            for i in 0..8 {
+                let offset = i * 8;
+                let val = usize::from_le_bytes(data[offset..offset+8].try_into().unwrap());
+                tracing::debug!("  [+{:2}]: 0x{:016X}", offset, val);
+            }
+        }
+
+        // 様々なオフセットで FName を探す
+        let offsets_to_try = [0usize, 8, 16, 24, 32, 40];
+
+        for &offset in &offsets_to_try {
+            if offset + 4 > data.len() {
+                continue;
+            }
+            let name_index = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+
+            // 有効な FName index の範囲チェック
+            // UE5 の FName index は通常 0x100000 未満
+            if name_index > 0 && name_index < 0x100000 {
+                if let Ok(name) = get_fname(name_index) {
+                    if name.ends_with("Property") {
+                        if should_log {
+                            tracing::debug!("  Found property name at offset {}: '{}' (index=0x{:X})", offset, name, name_index);
+                        }
+                        return Ok(name);
+                    }
+                }
+            }
+        }
+
+        // "Property" が見つからない場合、より広範な検索
+        // インデックスが小さくて有効な名前を返すものを使う
+        for &offset in &offsets_to_try {
+            if offset + 4 > data.len() {
+                continue;
+            }
+            let name_index = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+
+            if name_index > 0 && name_index < 0x100000 {
+                if let Ok(name) = get_fname(name_index) {
+                    // 空でない意味のある名前
+                    if !name.is_empty() && name.len() < 100 && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        if should_log {
+                            tracing::debug!("  Found valid name at offset {}: '{}' (index=0x{:X})", offset, name, name_index);
+                        }
+                        return Ok(name);
+                    }
+                }
+            }
+        }
+
+        // どのオフセットでも有効な名前が見つからない場合
+        tracing::debug!(
+            "FFieldClass at 0x{:X}: no valid property name found",
+            class_addr
+        );
+
+        Err(anyhow::anyhow!("No valid FName found in FFieldClass at 0x{:X}", class_addr))
+    }
+}
+
+/// UFunction の UStruct 部分を読み取るための専用構造体
+/// UFunction は UStruct を継承しているが、オフセットが異なる場合がある
+#[derive(Debug)]
+pub struct UFunctionStruct {
+    pub super_struct: usize,     // UStruct* - 親構造体
+    pub children: usize,         // TObjectPtr<UField> - 子関数 (通常は0)
+    pub child_properties: usize, // FField* - パラメータ (FProperty) リンクリスト
+    pub properties_size: i32,    // パラメータ構造体のサイズ
+    pub min_alignment: i32,      // 最小アラインメント
+}
+
+impl UFunctionStruct {
+    /// UFunction から UStruct 部分を読み取る
+    /// UE5.5 レイアウト:
+    /// - UObjectBase: vtable(8) + ObjectFlags(4) + InternalIndex(4) + Class(8) + Name(8) + Outer(8) = 40 bytes
+    /// - UField::Next: 8 bytes → total 48 bytes
+    /// - FStructBaseChain (条件付き): 16 bytes → total 64 bytes
+    /// - UStruct: SuperStruct(8) + Children(8) + ChildProperties(8) + PropertiesSize(4) + MinAlignment(4)
+    pub fn read(handle: HANDLE, func_addr: usize) -> Result<Self, anyhow::Error> {
+        // UFunction の場合、オフセット 48 または 64 を試す
+        // デバッグ: 複数のオフセットの結果を比較
+        static DEBUG_UFUNC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let should_log = DEBUG_UFUNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5;
+
+        let mut best_result: Option<(usize, Self)> = None;
+
+        for offset in [48usize, 64, 56, 72, 80] {
+            if let Ok(data) = read_process_memory(handle, func_addr + offset, 32) {
+                let super_struct = usize::from_le_bytes(data[0..8].try_into().unwrap());
+                let children = usize::from_le_bytes(data[8..16].try_into().unwrap());
+                let child_properties = usize::from_le_bytes(data[16..24].try_into().unwrap());
+                let properties_size = i32::from_le_bytes(data[24..28].try_into().unwrap());
+                let min_alignment = i32::from_le_bytes(data[28..32].try_into().unwrap());
+
+                if should_log {
+                    tracing::debug!(
+                        "UFunctionStruct offset {}: super=0x{:X} children=0x{:X} props=0x{:X} size={} align={}",
+                        offset, super_struct, children, child_properties, properties_size, min_alignment
+                    );
+                }
+
+                // UFunction のパラメータサイズは通常小さい（0〜数百バイト）
+                if properties_size >= 0 && properties_size < 0x10000
+                    && min_alignment >= 0 && min_alignment <= 16
+                {
+                    // child_properties が有効なヒープポインタっぽいか 0
+                    let props_valid = child_properties == 0
+                        || (child_properties > 0x100000000 && child_properties < 0x7FFFFFFFFFFF);
+
+                    // super_struct が有効なポインタっぽいか 0
+                    let super_valid = super_struct == 0
+                        || (super_struct > 0x100000000 && super_struct < 0x7FFFFFFFFFFF);
+
+                    if props_valid && super_valid {
+                        let result = Self {
+                            super_struct,
+                            children,
+                            child_properties,
+                            properties_size,
+                            min_alignment,
+                        };
+                        // child_properties が非ゼロの場合を優先
+                        if child_properties != 0 {
+                            return Ok(result);
+                        }
+                        if best_result.is_none() {
+                            best_result = Some((offset, result));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 非ゼロの child_properties が見つからなかった場合、最初に見つかった有効な結果を返す
+        if let Some((_, result)) = best_result {
+            return Ok(result);
+        }
+
+        // フォールバック: オフセット 48 を使用
+        let offset = 48;
+        let data = read_process_memory(handle, func_addr + offset, 32)?;
+        Ok(Self {
+            super_struct: usize::from_le_bytes(data[0..8].try_into().unwrap()),
+            children: usize::from_le_bytes(data[8..16].try_into().unwrap()),
+            child_properties: usize::from_le_bytes(data[16..24].try_into().unwrap()),
+            properties_size: i32::from_le_bytes(data[24..28].try_into().unwrap()),
+            min_alignment: i32::from_le_bytes(data[28..32].try_into().unwrap()),
+        })
     }
 }
 

@@ -1,6 +1,6 @@
 /// Method enumeration and invocation
 
-use super::structures::{FField, FFieldClass, UObject, UStruct};
+use super::structures::{FField, FFieldClass, UFunctionStruct, UObject, UStruct};
 use super::{EngineError, Result, UnrealEngine};
 use crate::engine::types::{
     ClassHandle, ClassInfo, FieldHandle, FieldInfo, InstanceHandle, MethodHandle, MethodInfo,
@@ -144,21 +144,21 @@ impl UnrealEngine {
         let handle_win = unsafe { std::mem::transmute::<usize, WinHandle>(self.process_handle) };
 
         // UFunction のパラメータ情報を読み取る
-        // UFunction は UStruct を継承しているので、ChildProperties からパラメータを取得
-        let ustruct = UStruct::read(handle_win, method_addr)
+        // UFunction 専用の構造体を使用（children == 0 を検証）
+        let ufunc = UFunctionStruct::read(handle_win, method_addr)
             .map_err(|e| EngineError::MemoryError(format!("Failed to read UFunction struct: {}", e)))?;
 
         let mut params = Vec::new();
         let mut return_type = None;
-        let mut current_prop = ustruct.child_properties;
+        let mut current_prop = ufunc.child_properties;
 
         // デバッグログ（メソッド情報用のカウンタ）
         static METHOD_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let should_log = METHOD_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20;
         if should_log {
             tracing::info!(
-                "get_method_info_impl: method='{}' addr=0x{:X} child_properties=0x{:X} super=0x{:X} children=0x{:X}",
-                name, method_addr, current_prop, ustruct.super_struct, ustruct.children
+                "get_method_info_impl: method='{}' addr=0x{:X} child_properties=0x{:X} props_size={} children=0x{:X}",
+                name, method_addr, current_prop, ufunc.properties_size, ufunc.children
             );
         }
 
@@ -235,16 +235,6 @@ impl UnrealEngine {
 
     /// FFieldClass から実際の型情報を取得
     fn get_property_type_info(&self, handle: WinHandle, prop_addr: usize, field: &FField) -> TypeInfo {
-        // FFieldClass から型名を取得
-        let type_class_name = if field.class_private != 0 {
-            FFieldClass::read_type_name(handle, field.class_private, |idx| {
-                self.get_fname_impl(idx).map_err(|e| anyhow::anyhow!("{}", e))
-            })
-            .unwrap_or_else(|_| "unknown".to_string())
-        } else {
-            "unknown".to_string()
-        };
-
         // FProperty::ElementSize を読み取る (FField(48) + ArrayDim(4) の後)
         let element_size_offset = 48usize + 4;
         let element_size = if let Ok(data) = read_process_memory(handle, prop_addr + element_size_offset, 4) {
@@ -253,8 +243,133 @@ impl UnrealEngine {
             0
         };
 
+        // パラメータ名を取得（フォールバック推論用）
+        let param_name = self.get_fname_impl(field.name.comparison_index).unwrap_or_default();
+
+        // FFieldClass から型名を取得
+        let type_class_name = if field.class_private != 0 {
+            match FFieldClass::read_type_name(handle, field.class_private, |idx| {
+                self.get_fname_impl(idx).map_err(|e| anyhow::anyhow!("{}", e))
+            }) {
+                Ok(name) => {
+                    // デバッグログ
+                    static TYPE_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if TYPE_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
+                        tracing::info!("get_property_type_info: class_private=0x{:X} -> '{}'", field.class_private, name);
+                    }
+                    name
+                }
+                Err(e) => {
+                    static ERR_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if ERR_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+                        tracing::warn!("get_property_type_info: failed to read type name at 0x{:X}: {}, using fallback", field.class_private, e);
+                    }
+                    // フォールバック: パラメータ名とサイズから型を推測
+                    self.guess_type_from_context(&param_name, element_size)
+                }
+            }
+        } else {
+            // class_private == 0 の場合もフォールバック
+            self.guess_type_from_context(&param_name, element_size)
+        };
+
         // 型クラス名から TypeInfo を生成
         self.property_class_to_type_info(&type_class_name, element_size)
+    }
+
+    /// パラメータ名とサイズから型を推測
+    fn guess_type_from_context(&self, param_name: &str, element_size: usize) -> String {
+        let name_lower = param_name.to_lowercase();
+
+        // オブジェクト参照系の推測
+        if name_lower.contains("controller") || name_lower.contains("actor")
+            || name_lower.contains("component") || name_lower.contains("widget")
+            || name_lower.contains("object") || name_lower.contains("owner")
+            || name_lower.contains("instigator") || name_lower.contains("target")
+            || name_lower.contains("pawn") || name_lower.contains("character")
+            || name_lower.contains("player") || name_lower.contains("camera")
+        {
+            return "ObjectProperty".to_string();
+        }
+
+        // 入力系の推測
+        if name_lower.contains("inputaction") || name_lower.contains("actionvalue") {
+            return "StructProperty".to_string();
+        }
+
+        // 時間系
+        if name_lower.contains("time") || name_lower.contains("delta")
+            || name_lower.contains("elapsed") || name_lower.contains("duration")
+        {
+            return "FloatProperty".to_string();
+        }
+
+        // ベクトル系
+        if name_lower.contains("location") || name_lower.contains("position")
+            || name_lower.contains("velocity") || name_lower.contains("direction")
+            || name_lower.contains("offset") || name_lower.contains("vector")
+        {
+            if element_size >= 12 {
+                return "StructProperty".to_string(); // FVector
+            }
+        }
+
+        // 回転系
+        if name_lower.contains("rotation") || name_lower.contains("rotator") {
+            return "StructProperty".to_string(); // FRotator
+        }
+
+        // ブール系
+        if name_lower.starts_with("is") || name_lower.starts_with("has")
+            || name_lower.starts_with("can") || name_lower.starts_with("should")
+            || name_lower.contains("enabled") || name_lower.contains("active")
+            || name_lower.contains("visible") || name_lower.contains("valid")
+            || name_lower == "success" || name_lower == "result"
+        {
+            if element_size <= 1 {
+                return "BoolProperty".to_string();
+            }
+        }
+
+        // 整数系
+        if name_lower.contains("index") || name_lower.contains("count")
+            || name_lower.contains("num") || name_lower.contains("id")
+            || name_lower.contains("amount") || name_lower.contains("level")
+        {
+            return "IntProperty".to_string();
+        }
+
+        // 文字列系
+        if name_lower.contains("name") || name_lower.contains("text")
+            || name_lower.contains("message") || name_lower.contains("string")
+            || name_lower.contains("label") || name_lower.contains("title")
+        {
+            if element_size >= 16 {
+                return "StrProperty".to_string();
+            } else if element_size == 8 {
+                return "NameProperty".to_string();
+            }
+        }
+
+        // サイズベースのフォールバック
+        match element_size {
+            1 => "ByteProperty".to_string(),
+            2 => "Int16Property".to_string(),
+            4 => "IntProperty".to_string(),
+            8 => "Int64Property".to_string(),  // ポインタまたは64bit整数
+            12 => "StructProperty".to_string(), // FVector
+            16 => "StructProperty".to_string(), // FString, TArray, FQuat
+            24 => "StructProperty".to_string(), // FText
+            48 => "StructProperty".to_string(), // FTransform
+            _ => {
+                // デフォルトでサイズに応じた推測
+                if element_size == 0 {
+                    "IntProperty".to_string() // デフォルト
+                } else {
+                    "StructProperty".to_string()
+                }
+            }
+        }
     }
 
     /// プロパティクラス名から TypeInfo を生成
@@ -397,12 +512,12 @@ impl UnrealEngine {
         let method_info = self.get_method_info_impl(method_addr)?;
 
         // UFunction の ParamsSize を読み取る
-        // UStruct を継承しているので PropertiesSize がパラメータ構造体のサイズ
-        let ustruct = UStruct::read(handle, method_addr)
+        // UFunctionStruct を使用
+        let ufunc = UFunctionStruct::read(handle, method_addr)
             .map_err(|e| EngineError::MemoryError(format!("Failed to read UFunction: {}", e)))?;
 
-        let params_size = if ustruct.properties_size > 0 {
-            ustruct.properties_size as usize
+        let params_size = if ufunc.properties_size > 0 {
+            ufunc.properties_size as usize
         } else {
             0x100 // フォールバック
         };
