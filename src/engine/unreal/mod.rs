@@ -6,7 +6,9 @@ use super::GameEngine;
 use std::any::Any;
 use std::collections::HashMap;
 
+pub mod hook;
 pub mod implementation;
+pub mod inject;
 pub mod methods;
 pub mod offsets;
 pub mod scanner;
@@ -362,14 +364,8 @@ impl GameEngine for UnrealEngine {
     }
 
     fn read_field(&self, instance: InstanceHandle, field: FieldHandle) -> Result<Value> {
-        // フィールドハンドルから offset と type を取得する必要があるが、
-        // 簡略化のため field.0 を offset として扱う
-        let type_info = TypeInfo {
-            name: "unknown".into(),
-            size: 4,
-            kind: TypeKind::Primitive(PrimitiveType::I32),
-        };
-        self.read_field_impl(instance.0, field.0, &type_info)
+        let field_info = self.get_field_info_impl(field.0)?;
+        self.read_field_impl(instance.0, field_info.offset, &field_info.type_info)
     }
 
     fn write_field(
@@ -378,7 +374,8 @@ impl GameEngine for UnrealEngine {
         field: FieldHandle,
         value: &Value,
     ) -> Result<()> {
-        self.write_field_impl(instance.0, field.0, value)
+        let field_info = self.get_field_info_impl(field.0)?;
+        self.write_field_impl(instance.0, field_info.offset, value)
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -840,23 +840,30 @@ impl UnrealEngine {
                 let data = read_process_memory(handle, addr, prim.size())?;
                 match prim {
                     PrimitiveType::Bool => Ok(Value::Bool(data[0] != 0)),
-                    PrimitiveType::I32 => Ok(Value::I32(i32::from_le_bytes(
-                        data[..4].try_into().unwrap(),
-                    ))),
-                    PrimitiveType::I64 => Ok(Value::I64(i64::from_le_bytes(
-                        data[..8].try_into().unwrap(),
-                    ))),
-                    PrimitiveType::F32 => Ok(Value::F32(f32::from_le_bytes(
-                        data[..4].try_into().unwrap(),
-                    ))),
-                    PrimitiveType::F64 => Ok(Value::F64(f64::from_le_bytes(
-                        data[..8].try_into().unwrap(),
-                    ))),
-                    _ => Ok(Value::Struct(data)),
+                    PrimitiveType::I8 => Ok(Value::I8(data[0] as i8)),
+                    PrimitiveType::I16 => Ok(Value::I16(i16::from_le_bytes(data[..2].try_into().unwrap()))),
+                    PrimitiveType::I32 => Ok(Value::I32(i32::from_le_bytes(data[..4].try_into().unwrap()))),
+                    PrimitiveType::I64 => Ok(Value::I64(i64::from_le_bytes(data[..8].try_into().unwrap()))),
+                    PrimitiveType::U8 => Ok(Value::U8(data[0])),
+                    PrimitiveType::U16 => Ok(Value::U16(u16::from_le_bytes(data[..2].try_into().unwrap()))),
+                    PrimitiveType::U32 => Ok(Value::U32(u32::from_le_bytes(data[..4].try_into().unwrap()))),
+                    PrimitiveType::U64 => Ok(Value::U64(u64::from_le_bytes(data[..8].try_into().unwrap()))),
+                    PrimitiveType::F32 => Ok(Value::F32(f32::from_le_bytes(data[..4].try_into().unwrap()))),
+                    PrimitiveType::F64 => Ok(Value::F64(f64::from_le_bytes(data[..8].try_into().unwrap()))),
+                }
+            }
+            TypeKind::Class(_) | TypeKind::Pointer(_) => {
+                let data = read_process_memory(handle, addr, 8)?;
+                let ptr = usize::from_le_bytes(data[..8].try_into().unwrap());
+                if ptr == 0 {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Object(InstanceHandle(ptr)))
                 }
             }
             _ => {
-                let data = read_process_memory(handle, addr, field_type.size)?;
+                let size = if field_type.size > 0 { field_type.size } else { 4 };
+                let data = read_process_memory(handle, addr, size)?;
                 Ok(Value::Struct(data))
             }
         }
@@ -875,14 +882,21 @@ impl UnrealEngine {
 
         let data = match value {
             Value::Bool(v) => vec![if *v { 1u8 } else { 0u8 }],
+            Value::I8(v) => v.to_le_bytes().to_vec(),
+            Value::I16(v) => v.to_le_bytes().to_vec(),
             Value::I32(v) => v.to_le_bytes().to_vec(),
             Value::I64(v) => v.to_le_bytes().to_vec(),
+            Value::U8(v) => v.to_le_bytes().to_vec(),
+            Value::U16(v) => v.to_le_bytes().to_vec(),
+            Value::U32(v) => v.to_le_bytes().to_vec(),
+            Value::U64(v) => v.to_le_bytes().to_vec(),
             Value::F32(v) => v.to_le_bytes().to_vec(),
             Value::F64(v) => v.to_le_bytes().to_vec(),
+            Value::Object(h) => h.0.to_le_bytes().to_vec(),
             Value::Struct(v) => v.clone(),
             _ => {
                 return Err(EngineError::TypeMismatch {
-                    expected: "primitive or struct".into(),
+                    expected: "primitive, object, or struct".into(),
                     got: format!("{:?}", value),
                 })
             }
@@ -954,15 +968,14 @@ impl UnrealEngine {
             }
         }
 
+        // FFieldClass から実際の型情報を取得
+        let type_info = self.get_property_type_info(handle, field_addr, &field);
+
         Ok(FieldInfo {
             name,
             handle: FieldHandle(field_addr),
             offset,
-            type_info: TypeInfo {
-                name: "unknown".into(),
-                size: 0,
-                kind: TypeKind::Unknown,
-            },
+            type_info,
         })
     }
 
