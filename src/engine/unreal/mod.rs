@@ -14,6 +14,7 @@ pub mod offsets;
 pub mod scanner;
 pub mod signatures;
 pub mod structures;
+pub mod trace;
 
 /// Unreal Engine のバージョン
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,29 +247,97 @@ impl GameEngine for UnrealEngine {
             return Ok(());
         }
 
-        // メインモジュールの情報を取得
-        let module = crate::platform::module::get_main_module(self.process_id)
-            .map_err(|e| EngineError::InitializationFailed(format!("Failed to get module info: {}", e)))?;
+        // 全モジュール一覧を取得
+        let modules = crate::platform::module::list_modules(self.process_id)
+            .map_err(|e| EngineError::InitializationFailed(format!("Failed to list modules: {}", e)))?;
 
-        self.module_base = module.base_address;
-        self.module_size = module.size;
+        if modules.is_empty() {
+            return Err(EngineError::InitializationFailed("No modules found".into()));
+        }
 
-        tracing::info!("Module: {} at 0x{:X} (size: 0x{:X})", module.name, self.module_base, self.module_size);
+        // メインモジュール（最初）を優先し、残りはサイズ降順
+        let main_module = modules[0].clone();
+        let mut try_order = vec![main_module.clone()];
+        let mut others: Vec<_> = modules.into_iter()
+            .filter(|m| m.base_address != main_module.base_address)
+            .collect();
+        others.sort_by(|a, b| b.size.cmp(&a.size));
+        try_order.extend(others);
 
-        // GObjects を先に検索（ヒープアドレス推定に使用）
-        self.gobjects_ptr = self.find_gobjects()?;
-        self.refresh_gobjects()?;
+        tracing::info!("Found {} modules. Main: {} (0x{:X}, size: 0x{:X})",
+            try_order.len(), main_module.name, main_module.base_address, main_module.size);
 
-        // GNames を検索（GObjects のヒープアドレスを参考にする）
-        self.gnames_ptr = self.find_gnames()?;
-        self.refresh_gnames()?;
+        // 各モジュールで GObjects を検索
+        let mut last_error = None;
+        for module in &try_order {
+            // 小さすぎるモジュール（64KB未満）はスキップ（メインモジュールは常に試す）
+            if module.size < 0x10000 && module.base_address != main_module.base_address {
+                continue;
+            }
 
-        // ProcessEvent を検索
-        self.process_event = self.find_process_event()?;
-        self.version = self.detect_version();
+            self.module_base = module.base_address;
+            self.module_size = module.size;
 
-        self.initialized = true;
-        Ok(())
+            tracing::info!("Trying module: {} at 0x{:X} (size: 0x{:X})",
+                module.name, module.base_address, module.size);
+
+            match self.find_gobjects() {
+                Ok(ptr) => {
+                    self.gobjects_ptr = ptr;
+                    self.refresh_gobjects()?;
+                    tracing::info!("GObjects found in module: {}", module.name);
+
+                    // GNames: 同じモジュールでまず試す、ダメなら他モジュール
+                    let gobjects_module_base = module.base_address;
+                    let gobjects_module_size = module.size;
+                    match self.find_gnames() {
+                        Ok(gnames_ptr) => {
+                            self.gnames_ptr = gnames_ptr;
+                        }
+                        Err(_) => {
+                            tracing::info!("GNames not in {}, searching other modules...", module.name);
+                            let mut gnames_found = false;
+                            for gn_mod in &try_order {
+                                if gn_mod.base_address == gobjects_module_base {
+                                    continue;
+                                }
+                                self.module_base = gn_mod.base_address;
+                                self.module_size = gn_mod.size;
+                                if let Ok(gnames_ptr) = self.find_gnames() {
+                                    self.gnames_ptr = gnames_ptr;
+                                    gnames_found = true;
+                                    tracing::info!("GNames found in module: {}", gn_mod.name);
+                                    break;
+                                }
+                            }
+                            if !gnames_found {
+                                return Err(EngineError::InitializationFailed(
+                                    "GNames not found in any module".into(),
+                                ));
+                            }
+                            // モジュール情報を GObjects のモジュールに戻す
+                            self.module_base = gobjects_module_base;
+                            self.module_size = gobjects_module_size;
+                        }
+                    }
+                    self.refresh_gnames()?;
+
+                    // ProcessEvent（見つからなくても続行）
+                    self.process_event = self.find_process_event().unwrap_or(0);
+                    self.version = self.detect_version();
+                    self.initialized = true;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!("GObjects not found in {}: {}", module.name, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| EngineError::InitializationFailed(
+            "GObjects not found in any module".into(),
+        )))
     }
 
     fn is_initialized(&self) -> bool {

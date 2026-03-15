@@ -93,6 +93,9 @@ pub struct EngineView {
 
     /// MonitorView へ渡すウォッチリクエスト
     pending_watches: Vec<WatchRequest>,
+
+    /// MonitorView へ渡すトレースリクエスト
+    pending_traces: Vec<crate::gui::monitor_view::TraceRequest>,
 }
 
 impl Default for EngineView {
@@ -124,6 +127,7 @@ impl Default for EngineView {
             selected_instance_class_name: None,
             show_blueprint_only: false,
             pending_watches: Vec::new(),
+            pending_traces: Vec::new(),
         }
     }
 }
@@ -137,6 +141,11 @@ impl EngineView {
     /// 溜まったウォッチリクエストを取得してクリア
     pub fn take_watch_requests(&mut self) -> Vec<WatchRequest> {
         std::mem::take(&mut self.pending_watches)
+    }
+
+    /// 溜まったトレースリクエストを取得してクリア
+    pub fn take_trace_requests(&mut self) -> Vec<crate::gui::monitor_view::TraceRequest> {
+        std::mem::take(&mut self.pending_traces)
     }
 
     pub fn set_engine(&mut self, engine: Box<dyn GameEngine>) {
@@ -365,6 +374,46 @@ impl EngineView {
 
             // インスタンス詳細パネル（プロパティとメソッド）
             if let Some(instance) = self.selected_instance {
+                // トレースボタン
+                if let Some(class) = self.selected_class {
+                    ui.horizontal(|ui| {
+                        if ui.button(egui::RichText::new("Trace All (Functions + Properties)")
+                            .color(egui::Color32::from_rgb(255, 150, 50)).strong()).clicked()
+                        {
+                            self.pending_traces.push(crate::gui::monitor_view::TraceRequest {
+                                instance,
+                                class,
+                                class_name: self.selected_class_name.clone(),
+                                trace_functions: true,
+                                trace_properties: true,
+                            });
+                        }
+                        if ui.button(egui::RichText::new("Trace Properties Only")
+                            .color(egui::Color32::from_rgb(255, 200, 50))).clicked()
+                        {
+                            self.pending_traces.push(crate::gui::monitor_view::TraceRequest {
+                                instance,
+                                class,
+                                class_name: self.selected_class_name.clone(),
+                                trace_functions: false,
+                                trace_properties: true,
+                            });
+                        }
+                        if ui.button(egui::RichText::new("Trace Functions Only")
+                            .color(egui::Color32::from_rgb(100, 200, 255))).clicked()
+                        {
+                            self.pending_traces.push(crate::gui::monitor_view::TraceRequest {
+                                instance,
+                                class,
+                                class_name: self.selected_class_name.clone(),
+                                trace_functions: true,
+                                trace_properties: false,
+                            });
+                        }
+                    });
+                    ui.separator();
+                }
+
                 self.render_instance_detail_panel(ui, instance);
             }
         }

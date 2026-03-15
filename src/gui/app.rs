@@ -441,6 +441,20 @@ impl eframe::App for LightScanApp {
                 self.monitor_view.add_watch(req);
             }
 
+            // EngineView → MonitorView へのトレースリクエスト転送
+            let trace_requests = self.engine_view.take_trace_requests();
+            if !trace_requests.is_empty() {
+                // エンジン参照を渡す
+                if let Some(engine) = self.engine_view.engine_ref() {
+                    self.monitor_view.set_engine(engine);
+                }
+                for req in trace_requests {
+                    self.monitor_view.handle_trace_request(req);
+                }
+                // モニタータブに自動切り替え
+                self.current_tab = AppTab::Monitor;
+            }
+
             // Tab content
             match self.current_tab {
                 AppTab::MemoryScan => self.show_memory_scan_tab(ui),
