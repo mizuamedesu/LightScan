@@ -955,16 +955,59 @@ impl UnrealEngine {
         // ただし、FField の実サイズは 40 バイト (8バイトアライメント) の可能性あり
         // その場合: Offset_Internal は +60 または +64
 
-        // 複数のオフセットを試す
+        // FProperty::Offset_Internal を読み取る
+        // UE5.x の FProperty レイアウト (FField base = 48 bytes aligned):
+        //   +48: ArrayDim (int32)
+        //   +52: ElementSize (int32)
+        //   +56: PropertyFlags (uint64)
+        //   +64: RepIndex (uint16)
+        //   +66: padding (2 bytes)
+        //   +68: Offset_Internal (int32)
+        //
+        // ただしビルドやバージョンで異なる場合がある。
+        // ElementSize と Offset_Internal の相関を使って正しい位置を特定する。
         let mut offset = 0usize;
-        for fprop_offset in [56usize, 60, 64, 68, 72, 44, 48, 52] {
-            if let Ok(data) = read_process_memory(handle, field_addr + fprop_offset, 4) {
-                let val = i32::from_le_bytes(data[..4].try_into().unwrap());
-                // 妥当な offset 値かチェック (0-65536 範囲)
-                if val >= 0 && val < 65536 {
-                    offset = val as usize;
-                    break;
+
+        // まず 96 バイト分を一括読み取り
+        if let Ok(raw) = read_process_memory(handle, field_addr, 96) {
+            // ElementSize (+52) を読んで型サイズを得る
+            let element_size = i32::from_le_bytes(raw[52..56].try_into().unwrap());
+
+            // Offset_Internal の候補位置を試す
+            // 最も一般的な +68 を最初に、次に +72, +76
+            for fprop_offset in [68usize, 72, 76, 80, 84, 88] {
+                if fprop_offset + 4 <= raw.len() {
+                    let val = i32::from_le_bytes(raw[fprop_offset..fprop_offset+4].try_into().unwrap());
+                    // 妥当な offset 値: 正の値で、構造体のサイズとして妥当な範囲
+                    // さらに4バイト以上のアラインメントを持つはず
+                    if val > 0 && val < 65536 && (val % 4 == 0 || element_size <= 2) {
+                        offset = val as usize;
+                        break;
+                    }
                 }
+            }
+
+            // 上記で見つからなかった場合、+44〜+64 の範囲でもフォールバック
+            if offset == 0 {
+                for fprop_offset in [56usize, 60, 64, 44, 48, 52] {
+                    if fprop_offset + 4 <= raw.len() {
+                        let val = i32::from_le_bytes(raw[fprop_offset..fprop_offset+4].try_into().unwrap());
+                        if val > 0 && val < 65536 {
+                            offset = val as usize;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // デバッグログ（最初の5フィールドだけ）
+            static OFFSET_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if OFFSET_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                tracing::info!(
+                    "FProperty 0x{:X} '{}': elem_size={}, offset={}, raw[44..92]={:02X?}",
+                    field_addr, name, element_size, offset,
+                    &raw[44..92.min(raw.len())]
+                );
             }
         }
 

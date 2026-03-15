@@ -15,8 +15,8 @@ use windows::Win32::System::Memory::{
     PAGE_WRITECOPY,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
-    PROCESS_VM_WRITE,
+    OpenProcess, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+    PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 
 /// Information about a running process
@@ -68,7 +68,7 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>> {
 pub fn open_process(pid: u32) -> Result<HANDLE> {
     unsafe {
         let handle = OpenProcess(
-            PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
+            PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION | PROCESS_CREATE_THREAD,
             false,
             pid,
         )?;

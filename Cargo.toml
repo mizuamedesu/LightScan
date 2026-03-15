@@ -52,3 +52,7 @@ opt-level = 1
 [[example]]
 name = "click_game"
 path = "examples/click_game.rs"
+
+[[example]]
+name = "ue_test"
+path = "examples/ue_test.rs"

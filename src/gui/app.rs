@@ -1,6 +1,6 @@
 use crate::gui::{
-    engine_view::EngineView, process_list::ProcessListView, results_view::ResultsView,
-    scan_view::ScanView,
+    engine_view::EngineView, monitor_view::MonitorView, process_list::ProcessListView,
+    results_view::ResultsView, scan_view::ScanView,
 };
 use crate::platform::ProcessInfo;
 use crate::scanner::{Process, Scanner};
@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 enum AppTab {
     MemoryScan,
     Engine,
+    Monitor,
 }
 
 /// Main application state
@@ -28,6 +29,9 @@ pub struct LightScanApp {
 
     // Engine abstraction
     engine_view: EngineView,
+
+    // Monitor / visualization
+    monitor_view: MonitorView,
 
     // UI state
     current_tab: AppTab,
@@ -48,6 +52,7 @@ impl Default for LightScanApp {
             scan_view: ScanView::default(),
             results_view: ResultsView::default(),
             engine_view: EngineView::default(),
+            monitor_view: MonitorView::default(),
             current_tab: AppTab::MemoryScan,
             show_process_list: false,
             error_message: None,
@@ -293,6 +298,14 @@ impl LightScanApp {
     fn show_engine_tab(&mut self, ui: &mut egui::Ui) {
         self.engine_view.ui(ui);
     }
+
+    fn show_monitor_tab(&mut self, ui: &mut egui::Ui) {
+        // エンジン参照をMonitorViewに渡す
+        if let Some(engine) = self.engine_view.engine_ref() {
+            self.monitor_view.set_engine(engine);
+        }
+        self.monitor_view.ui(ui);
+    }
 }
 
 impl eframe::App for LightScanApp {
@@ -408,14 +421,31 @@ impl eframe::App for LightScanApp {
                 {
                     self.current_tab = AppTab::Engine;
                 }
+                let monitor_label = if self.monitor_view.has_watches() {
+                    format!("Monitor ({})", "LIVE")
+                } else {
+                    "Monitor".to_string()
+                };
+                if ui
+                    .selectable_label(self.current_tab == AppTab::Monitor, monitor_label)
+                    .clicked()
+                {
+                    self.current_tab = AppTab::Monitor;
+                }
             });
 
             ui.separator();
+
+            // EngineView → MonitorView へのウォッチリクエスト転送
+            for req in self.engine_view.take_watch_requests() {
+                self.monitor_view.add_watch(req);
+            }
 
             // Tab content
             match self.current_tab {
                 AppTab::MemoryScan => self.show_memory_scan_tab(ui),
                 AppTab::Engine => self.show_engine_tab(ui),
+                AppTab::Monitor => self.show_monitor_tab(ui),
             }
         });
     }

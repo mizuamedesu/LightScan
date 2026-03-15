@@ -1,6 +1,7 @@
 /// Engine abstraction GUI view
 
 use crate::engine::{GameEngine, *};
+use crate::gui::monitor_view::WatchRequest;
 use eframe::egui;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -89,6 +90,9 @@ pub struct EngineView {
 
     /// Blueprint関数のみ表示フラグ
     show_blueprint_only: bool,
+
+    /// MonitorView へ渡すウォッチリクエスト
+    pending_watches: Vec<WatchRequest>,
 }
 
 impl Default for EngineView {
@@ -119,11 +123,22 @@ impl Default for EngineView {
             last_invoke_result: None,
             selected_instance_class_name: None,
             show_blueprint_only: false,
+            pending_watches: Vec::new(),
         }
     }
 }
 
 impl EngineView {
+    /// エンジンの Arc 参照を取得（MonitorView と共有用）
+    pub fn engine_ref(&self) -> Option<Arc<Mutex<Box<dyn GameEngine>>>> {
+        self.engine.clone()
+    }
+
+    /// 溜まったウォッチリクエストを取得してクリア
+    pub fn take_watch_requests(&mut self) -> Vec<WatchRequest> {
+        std::mem::take(&mut self.pending_watches)
+    }
+
     pub fn set_engine(&mut self, engine: Box<dyn GameEngine>) {
         self.engine = Some(Arc::new(Mutex::new(engine)));
         self.initialized = false;
@@ -665,6 +680,8 @@ impl EngineView {
         // 書き込み要求を収集
         let mut write_requests: Vec<(FieldHandle, Value, TypeInfo)> = Vec::new();
         let mut edit_updates: Vec<(FieldHandle, String, bool)> = Vec::new();
+        let mut new_watches: Vec<WatchRequest> = Vec::new();
+        let class_name = self.selected_instance_class_name.clone().unwrap_or_default();
 
         for (field, prop_state) in &fields_with_state {
             ui.group(|ui| {
@@ -673,6 +690,20 @@ impl EngineView {
                     ui.label(egui::RichText::new(&field.name).strong());
                     ui.label(format!("({})", field.type_info.name));
                     ui.label(format!("[0x{:X}]", field.offset));
+
+                    // Watch ボタン
+                    if ui
+                        .button(egui::RichText::new("Watch").small().color(egui::Color32::from_rgb(100, 200, 255)))
+                        .clicked()
+                    {
+                        new_watches.push(WatchRequest {
+                            instance,
+                            field: field.handle,
+                            field_name: field.name.clone(),
+                            class_name: class_name.clone(),
+                            type_info: field.type_info.clone(),
+                        });
+                    }
                 });
 
                 ui.horizontal(|ui| {
@@ -732,6 +763,9 @@ impl EngineView {
         for (field_handle, new_value, _) in write_requests {
             self.write_property(instance, field_handle, new_value);
         }
+
+        // ウォッチリクエスト追加
+        self.pending_watches.extend(new_watches);
 
         if !error_fields.is_empty() {
             self.error_message = format!("Failed to parse values for some fields");
